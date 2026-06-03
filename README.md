@@ -123,16 +123,20 @@ camera:
 5. **📷 Save view** stores the current camera angle as the default.
 6. Everything is written back to the card's YAML automatically.
 
-### Spinning fans
+### Spinning fans (+ integrated light)
 
 Map a ceiling-fan **object in the model** to a `fan.*` entity so it spins when on:
 
-1. Click **🌀 Add fan**, then click the fan object in the model.
-2. Pick the **fan entity** from the dropdown; optionally tick **Reverse spin**.
-3. The object now spins whenever the entity is on, with speed following the
-   fan's `percentage` (so speed 1/2/3 → slow/medium/fast). Tapping a fan on the
-   dashboard toggles it.
-4. Click an existing fan to re-select it; **🗑 Remove fan** deletes the mapping.
+1. Click **🌀 Add fan**, then click the **centre/hub** of the fan in the model
+   (the click point sets the spin axis — clicking the hub avoids any wobble).
+2. Pick the **fan entity**. If the fan has a light kit, also pick the **light
+   entity** — the fan then glows/illuminates when the light is on.
+3. Optionally tick **Reverse spin**.
+4. Spin speed follows the fan's `percentage` (so speed 1/2/3 → slow/medium/fast).
+5. Click an existing fan to re-select it; **🗑 Remove fan** deletes the mapping.
+
+**On the dashboard, tap a fan** to open a control popup with **Light on/off**,
+**Fan on/off**, and **speed − / +** (uses `fan.increase_speed`/`decrease_speed`).
 
 > **Model requirement:** the fan must be a *separate object* in the GLB. The
 > `optimize` command's `--join`/`--flatten` steps merge everything into one mesh
@@ -147,7 +151,7 @@ Map a ceiling-fan **object in the model** to a `fan.*` entity so it spins when o
 |---|---|---|---|
 | `model` | path | _(none)_ | `/local/…glb` model of your home. **Required.** |
 | `lights` | list | `[]` | Light markers: each `{ entity, position:[x,y,z], color?, size? }`. |
-| `fans` | list | `[]` | Spinning fans: each `{ entity, object:"<node name>", position:[x,y,z], reverse? }`. The model object spins when the fan is on; speed follows the fan's `percentage`. |
+| `fans` | list | `[]` | Spinning fans: each `{ entity, object:"<node name>", position:[x,y,z], light?, reverse? }`. The object spins when the fan is on (speed ∝ `percentage`); the optional `light` entity makes the fan glow/illuminate and adds a light toggle to the popup. |
 | `fan_min_speed` | number | `1.5` | Spin speed (rad/s) at the lowest non-zero fan percentage. |
 | `fan_max_speed` | number | `11` | Spin speed (rad/s) at 100%. |
 | `default_glow_color` | colour | `#ffd27f` | Glow colour for lights without their own `color`. |

@@ -373,32 +373,51 @@ class Home3DScene {
     this._fanCfg = cfg || {};
     // tear down previous rigs — return nodes to their original parents first
     for (const f of this.fans) {
-      if (f.pivot && f.node) {
-        (f.origParent || this._modelRoot).attach(f.node);
-        this.scene.remove(f.pivot);
-      }
+      if (f.node) (f.origParent || this._modelRoot).attach(f.node);
+      if (f.pivot) this.scene.remove(f.pivot);
+      if (f.lightObj) this.scene.remove(f.lightObj);
     }
     this.fans = [];
     if (!this._modelRoot) return;
+    const castLight = cfg.cast_light !== false;
+    const maxDim = this._modelMaxDim || 100;
+    const distance = maxDim * (cfg.light_distance ?? 0.45);
+    const ref = distance * 0.5;
+    const baseIntensity = ref * ref * (cfg.light_intensity ?? 2);
     (fans || []).forEach((cf) => {
       const node = this._findObject(cf.object, cf.position);
-      if (!node) {
-        this.fans.push({ entity: cf.entity, node: null, pivot: null, speed: 0, target: 0 });
-        return;
+      let pivot = null;
+      let origParent = null;
+      if (node) {
+        const center = new THREE.Box3()
+          .setFromObject(node)
+          .getCenter(new THREE.Vector3());
+        // Spin axis passes through the clicked point (X/Z) so an off-centre
+        // bounding box doesn't make the fan orbit/wobble. Click the hub.
+        const ax = cf.position ? cf.position[0] : center.x;
+        const az = cf.position ? cf.position[2] : center.z;
+        origParent = node.parent || this._modelRoot;
+        pivot = new THREE.Group();
+        pivot.position.set(ax, center.y, az);
+        this.scene.add(pivot);
+        pivot.attach(node); // keeps world transform; spins around world-Y
       }
-      const center = new THREE.Box3()
-        .setFromObject(node)
-        .getCenter(new THREE.Vector3());
-      const origParent = node.parent || this._modelRoot;
-      const pivot = new THREE.Group();
-      pivot.position.copy(center);
-      this.scene.add(pivot);
-      pivot.attach(node); // keeps world transform; spins around world-Y at centre
+      // Optional integrated light (these fans have a light kit).
+      let lightObj = null;
+      if (castLight && cf.light) {
+        const p = cf.position || [0, 0, 0];
+        lightObj = new THREE.PointLight(new THREE.Color("#ffe0b0"), 0, distance, 2);
+        lightObj.position.set(p[0], p[1], p[2]);
+        this.scene.add(lightObj);
+      }
       this.fans.push({
         entity: cf.entity,
+        light: cf.light || "",
         node,
         pivot,
         origParent,
+        lightObj,
+        baseIntensity,
         speed: 0, // current angular velocity (rad/s)
         target: 0, // desired angular velocity
         reverse: !!cf.reverse,
@@ -406,8 +425,11 @@ class Home3DScene {
     });
   }
 
-  /** getFan(entity) => { on, percent:0..1 }. Sets each fan's target speed. */
-  updateFanStates(getFan) {
+  /**
+   * getFan(entity) => { on, percent:0..1 } sets spin; getLight(entity) =>
+   * { on, brightness:0..1 } drives the integrated light.
+   */
+  updateFanStates(getFan, getLight) {
     const cfg = this._fanCfg || {};
     const min = cfg.fan_min_speed ?? 1.5;
     const max = cfg.fan_max_speed ?? 11;
@@ -418,6 +440,12 @@ class Home3DScene {
       let t = on ? min + (max - min) * pct : 0;
       if (f.reverse) t = -t;
       f.target = t;
+      if (f.lightObj) {
+        const ls = f.light && getLight ? getLight(f.light) : { on: false, brightness: 0 };
+        const lon = !!(ls && ls.on);
+        const b = lon ? clamp(ls.brightness ?? 1, 0, 1) : 0;
+        f.lightObj.intensity = lon ? f.baseIntensity * (0.35 + 0.65 * b) : 0;
+      }
     }
   }
 
@@ -598,6 +626,7 @@ class Home3DCard extends HTMLElement {
     this._hass = null;
     this._scene = null;
     this._ready = false;
+    this._popupFan = null;
   }
 
   static getConfigElement() {
@@ -659,8 +688,12 @@ class Home3DCard extends HTMLElement {
   _applyStates() {
     if (this._scene && this._ready) {
       this._scene.updateStates((e) => this._stateFor(e));
-      this._scene.updateFanStates((e) => this._fanStateFor(e));
+      this._scene.updateFanStates(
+        (e) => this._fanStateFor(e),
+        (e) => this._stateFor(e)
+      );
     }
+    if (this._popupFan != null) this._renderFanPopup();
   }
 
   async _build() {
@@ -676,18 +709,47 @@ class Home3DCard extends HTMLElement {
           justify-content:center; text-align:center; padding:16px;
           color: var(--secondary-text-color,#9aa0a6); font-size:0.9rem;
         }
+        .pop-back { position:absolute; inset:0; display:none; z-index:5; }
+        .pop-back.show { display:block; }
+        .popup {
+          position:absolute; z-index:6; left:50%; bottom:12px;
+          transform:translateX(-50%);
+          background: rgba(20,24,32,0.96); color:#fff;
+          border:1px solid rgba(255,255,255,0.14); border-radius:14px;
+          padding:10px 12px; min-width:210px; display:none;
+          box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(8px);
+        }
+        .popup.show { display:block; }
+        .popup .title { font-size:0.8rem; font-weight:700; margin-bottom:8px; opacity:0.9; }
+        .popup .row { display:flex; gap:8px; align-items:center; margin-top:6px; }
+        .popup button {
+          flex:1; background: rgba(255,255,255,0.08); color:#fff; cursor:pointer;
+          border:1px solid rgba(255,255,255,0.14); border-radius:9px;
+          padding:9px 8px; font-size:0.85rem;
+        }
+        .popup button.on { background: var(--primary-color,#3b82f6); border-color:transparent; }
+        .popup button.icon { flex:0 0 44px; font-size:1.1rem; }
+        .popup .spd { flex:1; text-align:center; font-weight:700; font-size:0.9rem; }
+        .popup .close { position:absolute; top:6px; right:8px; background:none;
+          border:none; color:#aaa; font-size:1rem; padding:2px 6px; flex:none; }
       </style>
       <ha-card>
         <div class="wrap">
           <div class="stage" id="stage"></div>
           <div class="msg" id="msg">Loading 3D model…</div>
+          <div class="pop-back" id="pop-back"></div>
+          <div class="popup" id="popup"></div>
         </div>
       </ha-card>`;
 
     const stage = root.getElementById("stage");
     const msg = root.getElementById("msg");
+    root.getElementById("pop-back").addEventListener("pointerdown", () =>
+      this._hideFanPopup()
+    );
     if (this._scene) this._scene.dispose();
     this._ready = false;
+    this._popupFan = null;
 
     if (!this._config.model) {
       msg.textContent =
@@ -702,12 +764,7 @@ class Home3DCard extends HTMLElement {
         this._hass.callService("light", "toggle", { entity_id: s.entity });
       }
     };
-    this._scene.onTapFan = (i) => {
-      const f = this._scene.fans[i];
-      if (f && f.entity && this._hass) {
-        this._hass.callService("fan", "toggle", { entity_id: f.entity });
-      }
-    };
+    this._scene.onTapFan = (i) => this._showFanPopup(i);
 
     try {
       await this._scene.init(
@@ -726,6 +783,94 @@ class Home3DCard extends HTMLElement {
       msg.textContent = `Failed to load 3D scene: ${err && err.message ? err.message : err}`;
       // eslint-disable-next-line no-console
       console.error("[home-3d-card]", err);
+    }
+  }
+
+  /* ---- fan control popup ---- */
+
+  _showFanPopup(i) {
+    this._popupFan = i;
+    const back = this.shadowRoot.getElementById("pop-back");
+    const pop = this.shadowRoot.getElementById("popup");
+    if (back) back.classList.add("show");
+    if (pop) pop.classList.add("show");
+    this._renderFanPopup();
+  }
+
+  _hideFanPopup() {
+    this._popupFan = null;
+    const back = this.shadowRoot.getElementById("pop-back");
+    const pop = this.shadowRoot.getElementById("popup");
+    if (back) back.classList.remove("show");
+    if (pop) pop.classList.remove("show");
+  }
+
+  _renderFanPopup() {
+    const pop = this.shadowRoot.getElementById("popup");
+    if (!pop || this._popupFan == null) return;
+    const cf = this._config.fans[this._popupFan];
+    if (!cf) {
+      this._hideFanPopup();
+      return;
+    }
+    const fan = cf.entity ? this._stateRaw(cf.entity) : null;
+    const light = cf.light ? this._stateRaw(cf.light) : null;
+    const fanOn = fan && fan.state === "on";
+    const pct = fan && fan.attributes ? fan.attributes.percentage : null;
+    const lightOn = light && light.state === "on";
+    const name =
+      (fan && fan.attributes && fan.attributes.friendly_name) ||
+      (light && light.attributes && light.attributes.friendly_name) ||
+      "Fan";
+
+    let rows = "";
+    if (cf.light) {
+      rows += `<div class="row">
+        <button class="${lightOn ? "on" : ""}" data-act="light">💡 Light ${lightOn ? "On" : "Off"}</button>
+      </div>`;
+    }
+    if (cf.entity) {
+      rows += `<div class="row">
+        <button class="${fanOn ? "on" : ""}" data-act="fan">🌀 Fan ${fanOn ? "On" : "Off"}</button>
+      </div>
+      <div class="row">
+        <button class="icon" data-act="down">－</button>
+        <span class="spd">${fanOn ? (pct != null ? pct + "%" : "On") : "Off"}</span>
+        <button class="icon" data-act="up">＋</button>
+      </div>`;
+    }
+    pop.innerHTML = `<button class="close" data-act="close">✕</button>
+      <div class="title">${name}</div>${rows}`;
+
+    pop.querySelectorAll("button[data-act]").forEach((b) =>
+      b.addEventListener("click", () => this._fanAction(b.dataset.act))
+    );
+  }
+
+  _stateRaw(entity) {
+    return this._hass && this._hass.states[entity];
+  }
+
+  _fanAction(act) {
+    const cf = this._config.fans[this._popupFan];
+    if (!cf || !this._hass) return;
+    const h = this._hass;
+    switch (act) {
+      case "close":
+        this._hideFanPopup();
+        return;
+      case "light":
+        if (cf.light) h.callService("light", "toggle", { entity_id: cf.light });
+        return;
+      case "fan":
+        if (cf.entity) h.callService("fan", "toggle", { entity_id: cf.entity });
+        return;
+      case "up":
+        if (cf.entity) h.callService("fan", "increase_speed", { entity_id: cf.entity });
+        return;
+      case "down":
+        if (cf.entity) h.callService("fan", "decrease_speed", { entity_id: cf.entity });
+        return;
     }
   }
 
@@ -781,7 +926,10 @@ class Home3DCardEditor extends HTMLElement {
       this._scene.setSprites(this._config.lights, this._config);
       this._scene.setFans(this._config.fans, this._config);
       this._scene.updateStates((e) => this._stateFor(e));
-      this._scene.updateFanStates((e) => this._fanStateFor(e));
+      this._scene.updateFanStates(
+        (e) => this._fanStateFor(e),
+        (e) => this._stateFor(e)
+      );
     }
   }
 
@@ -791,7 +939,10 @@ class Home3DCardEditor extends HTMLElement {
     this._fillFanPicker();
     if (this._scene && this._ready) {
       this._scene.updateStates((e) => this._stateFor(e));
-      this._scene.updateFanStates((e) => this._fanStateFor(e));
+      this._scene.updateFanStates(
+        (e) => this._fanStateFor(e),
+        (e) => this._stateFor(e)
+      );
     }
   }
 
@@ -855,16 +1006,24 @@ class Home3DCardEditor extends HTMLElement {
 
   _fillFanPicker() {
     const sel = this.shadowRoot.getElementById("fan-pick");
-    if (!sel || sel.childElementCount) return;
-    sel.innerHTML =
-      `<option value="">— pick a fan entity —</option>` +
-      this._fanEntities()
-        .map((e) => {
-          const fn =
-            (this._hass.states[e].attributes || {}).friendly_name || e;
-          return `<option value="${e}">${fn}</option>`;
-        })
-        .join("");
+    if (sel && !sel.childElementCount) {
+      sel.innerHTML =
+        `<option value="">— pick a fan entity —</option>` +
+        this._fanEntities()
+          .map((e) => {
+            const fn = (this._hass.states[e].attributes || {}).friendly_name || e;
+            return `<option value="${e}">${fn}</option>`;
+          })
+          .join("");
+    }
+    const lsel = this.shadowRoot.getElementById("fan-light");
+    if (lsel && !lsel.childElementCount) {
+      lsel.innerHTML =
+        `<option value="">— none —</option>` +
+        this._lightEntities()
+          .map((e) => `<option value="${e}">${e}</option>`)
+          .join("");
+    }
   }
 
   async _build() {
@@ -940,6 +1099,10 @@ class Home3DCardEditor extends HTMLElement {
           <label class="f">
             <span>Fan entity</span>
             <select id="fan-pick"></select>
+          </label>
+          <label class="f">
+            <span>Light entity (optional)</span>
+            <select id="fan-light"></select>
           </label>
           <label class="f" style="flex-direction:row; align-items:center; gap:8px;">
             <input type="checkbox" id="fan-reverse" />
@@ -1024,7 +1187,10 @@ class Home3DCardEditor extends HTMLElement {
       this._ready = true;
       msg.style.display = "none";
       this._scene.updateStates((e) => this._stateFor(e));
-      this._scene.updateFanStates((e) => this._fanStateFor(e));
+      this._scene.updateFanStates(
+        (e) => this._fanStateFor(e),
+        (e) => this._stateFor(e)
+      );
     } catch (err) {
       msg.textContent = `Failed to load 3D scene: ${err && err.message ? err.message : err}`;
       // eslint-disable-next-line no-console
@@ -1074,7 +1240,10 @@ class Home3DCardEditor extends HTMLElement {
     this._config.fans.push(fan);
     this._emit();
     this._scene.setFans(this._config.fans, this._config);
-    this._scene.updateFanStates((e) => this._fanStateFor(e));
+    this._scene.updateFanStates(
+        (e) => this._fanStateFor(e),
+        (e) => this._stateFor(e)
+      );
     this._selectFan(this._config.fans.length - 1);
     this.shadowRoot.getElementById("placehint").textContent = "";
   }
@@ -1091,6 +1260,7 @@ class Home3DCardEditor extends HTMLElement {
     panel.hidden = false;
     const f = this._config.fans[this._selectedFan];
     this.shadowRoot.getElementById("fan-pick").value = f.entity || "";
+    this.shadowRoot.getElementById("fan-light").value = f.light || "";
     this.shadowRoot.getElementById("fan-reverse").checked = !!f.reverse;
     this.shadowRoot.getElementById("fan-obj").textContent = f.object
       ? `Object: ${f.object}`
@@ -1132,26 +1302,40 @@ class Home3DCardEditor extends HTMLElement {
 
   _wireFanPanel() {
     const root = this.shadowRoot;
+    const refresh = () => {
+      this._scene.setFans(this._config.fans, this._config);
+      this._scene.updateFanStates(
+        (en) => this._fanStateFor(en),
+        (en) => this._stateFor(en)
+      );
+    };
     root.getElementById("fan-pick").addEventListener("change", (e) => {
       if (this._selectedFan < 0) return;
       this._config.fans[this._selectedFan].entity = e.target.value;
       this._emit();
-      this._scene.updateFanStates((en) => this._fanStateFor(en));
+      this._scene.updateFanStates(
+        (en) => this._fanStateFor(en),
+        (en) => this._stateFor(en)
+      );
+    });
+    root.getElementById("fan-light").addEventListener("change", (e) => {
+      if (this._selectedFan < 0) return;
+      this._config.fans[this._selectedFan].light = e.target.value;
+      this._emit();
+      refresh(); // light source is (re)created in setFans
     });
     root.getElementById("fan-reverse").addEventListener("change", (e) => {
       if (this._selectedFan < 0) return;
       this._config.fans[this._selectedFan].reverse = e.target.checked;
       this._emit();
-      this._scene.setFans(this._config.fans, this._config);
-      this._scene.updateFanStates((en) => this._fanStateFor(en));
+      refresh();
     });
     root.getElementById("fan-del").addEventListener("click", () => {
       if (this._selectedFan < 0) return;
       this._config.fans.splice(this._selectedFan, 1);
       this._emit();
-      this._scene.setFans(this._config.fans, this._config);
       this._selectFan(null);
-      this._scene.updateFanStates((en) => this._fanStateFor(en));
+      refresh();
     });
   }
 

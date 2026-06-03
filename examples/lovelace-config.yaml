@@ -34,7 +34,8 @@ lights:
 fans:
   - entity: fan.office_switch
     object: Ceiling_lamp_034_2141   # the node clicked in the editor
-    position: [120, 250, -80]
+    position: [120, 250, -80]       # click the hub — this sets the spin axis
+    light: light.office             # optional: fan's light kit (glows + popup)
     # reverse: true                 # spin the other way if needed
 # fan_min_speed: 1.5                 # rad/s at lowest percentage
 # fan_max_speed: 11                  # rad/s at 100%
