@@ -400,8 +400,18 @@ class Home3DCard extends HTMLElement {
 
   setConfig(config) {
     if (!config) throw new Error("Invalid configuration");
-    this._config = { ...DEFAULTS, ...config };
-    this._build();
+    const incoming = { ...DEFAULTS, ...config };
+    if (!incoming.lights) incoming.lights = [];
+    const modelChanged =
+      !this._scene || incoming.model !== (this._config && this._config.model);
+    this._config = incoming;
+    if (modelChanged) {
+      this._build(); // first build, or model path changed → (re)load scene
+    } else if (this._ready) {
+      // Only lights/appearance changed → refresh markers without reloading.
+      this._scene.setSprites(this._config.lights, this._config);
+      this._applyStates();
+    }
   }
 
   set hass(hass) {
@@ -502,12 +512,36 @@ class Home3DCardEditor extends HTMLElement {
     this._scene = null;
     this._ready = false;
     this._selected = -1;
+    this._built = false;
   }
 
   setConfig(config) {
-    this._config = { ...DEFAULTS, ...config };
-    if (!this._config.lights) this._config.lights = [];
-    this._build();
+    const incoming = { ...DEFAULTS, ...config };
+    if (!incoming.lights) incoming.lights = [];
+
+    // HA echoes our own config-changed back by calling setConfig again. If it
+    // matches what we already have, swallow it — otherwise every placed light
+    // would tear down and reload the whole 3D scene.
+    if (
+      this._built &&
+      this._config &&
+      JSON.stringify(incoming) === JSON.stringify(this._config)
+    ) {
+      this._config = incoming;
+      return;
+    }
+
+    const modelChanged =
+      !this._built || incoming.model !== (this._config && this._config.model);
+    this._config = incoming;
+
+    if (!this._built || modelChanged) {
+      this._build(); // first build, or model path changed → (re)load scene
+    } else if (this._scene && this._ready) {
+      // Only lights/appearance changed externally → refresh markers in place.
+      this._scene.setSprites(this._config.lights, this._config);
+      this._scene.updateStates((e) => this._stateFor(e));
+    }
   }
 
   set hass(hass) {
@@ -624,6 +658,7 @@ class Home3DCardEditor extends HTMLElement {
         </div>
       </div>
     `;
+    this._built = true; // DOM exists; future setConfig echoes won't rebuild
 
     // model path field
     const modelInput = root.getElementById("model");
