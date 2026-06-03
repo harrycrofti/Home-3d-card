@@ -61,8 +61,13 @@ const DEFAULTS = {
   three_cdn: DEFAULT_CDN,
   default_glow_color: "#ffd27f",
   default_size: 1, // marker size multiplier (×) of the model-relative base size
-  ambient_intensity: 0.9,
+  ambient_intensity: 0.6, // base fill light (lower → room lighting reads more)
   background: "#0d1016",
+  // Room lighting: each light marker also casts a real light into the model
+  // when its entity is on, scaled by brightness.
+  cast_light: true,
+  light_intensity: 2, // brightness multiplier for the cast room light
+  light_distance: 0.45, // light reach as a fraction of the model's size
   lights: [], // [{ entity, position:[x,y,z], color?, size? }]
   camera: undefined, // { position:[x,y,z], target:[x,y,z] }
 };
@@ -117,9 +122,10 @@ class Home3DScene {
     this._selectedIndex = -1;
   }
 
-  async init(cdn, background) {
+  async init(cdn, background, cfg) {
     await loadThree(cdn);
     if (this._disposed) return;
+    this._cfg = cfg || DEFAULTS;
     this._glowTex = makeGlowTexture();
 
     const w = this.container.clientWidth || 600;
@@ -145,7 +151,11 @@ class Home3DScene {
     this.controls.dampingFactor = 0.08;
 
     // Lighting so the model is visible (the home's own ceiling is removed).
-    this.scene.add(new THREE.AmbientLight(0xffffff, DEFAULTS.ambient_intensity));
+    const amb =
+      this._cfg.ambient_intensity != null
+        ? this._cfg.ambient_intensity
+        : DEFAULTS.ambient_intensity;
+    this.scene.add(new THREE.AmbientLight(0xffffff, amb));
     const key = new THREE.DirectionalLight(0xffffff, 0.8);
     key.position.set(5, 10, 7);
     this.scene.add(key);
@@ -198,6 +208,7 @@ class Home3DScene {
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z) || 5;
+    this._modelMaxDim = maxDim;
     // Base marker size derived from the model so sprites are visible/tappable
     // regardless of the model's unit scale (SH3D exports in centimetres).
     this._baseSize = maxDim * 0.02;
@@ -232,10 +243,17 @@ class Home3DScene {
 
   /** Rebuild all sprite objects from a lights config array. */
   setSprites(lights, defaults) {
-    // remove old
-    for (const s of this.sprites) this.scene.remove(s.object);
+    // remove old markers + their cast lights
+    for (const s of this.sprites) {
+      this.scene.remove(s.object);
+      if (s.light) this.scene.remove(s.light);
+    }
     this.sprites = [];
     const base = this._baseSize || 1;
+    const castLight = defaults.cast_light !== false;
+    const maxDim = this._modelMaxDim || 100;
+    const distance = maxDim * (defaults.light_distance ?? 0.45);
+    const intensityMult = defaults.light_intensity ?? 2;
     (lights || []).forEach((l) => {
       const color = l.color || defaults.default_glow_color;
       // size is a multiplier of the model-relative base size (default 1).
@@ -256,12 +274,27 @@ class Home3DScene {
       sprite.renderOrder = 999; // draw on top of the model
       sprite.userData.isLightSprite = true;
       this.scene.add(sprite);
+
+      // Real light that illuminates the room when the entity is on. With
+      // physical falloff (decay 2), peak intensity scales with distance².
+      let light = null;
+      let baseIntensity = 0;
+      if (castLight) {
+        light = new THREE.PointLight(new THREE.Color(color), 0, distance, 2);
+        light.position.set(p[0], p[1], p[2]);
+        this.scene.add(light);
+        const ref = distance * 0.5;
+        baseIntensity = ref * ref * intensityMult;
+      }
+
       this.sprites.push({
         entity: l.entity,
         color,
         size,
         position: [p[0], p[1], p[2]],
         object: sprite,
+        light,
+        baseIntensity,
       });
     });
   }
@@ -277,6 +310,8 @@ class Home3DScene {
       mat.opacity = on ? 0.45 + 0.55 * b : 0.25;
       const pulse = on ? 1 + 0.3 * b : 0.7;
       s.object.scale.setScalar(base * s.size * pulse);
+      // Room lighting: intensity follows brightness, off = dark.
+      if (s.light) s.light.intensity = on ? s.baseIntensity * (0.35 + 0.65 * b) : 0;
     }
   }
 
@@ -493,7 +528,11 @@ class Home3DCard extends HTMLElement {
     };
 
     try {
-      await this._scene.init(this._config.three_cdn, this._config.background);
+      await this._scene.init(
+        this._config.three_cdn,
+        this._config.background,
+        this._config
+      );
       await this._scene.loadModel(this._config.model);
       if (this._config.camera) this._scene.applyCamera(this._config.camera);
       this._scene.setSprites(this._config.lights, this._config);
@@ -721,7 +760,11 @@ class Home3DCardEditor extends HTMLElement {
     };
 
     try {
-      await this._scene.init(this._config.three_cdn, this._config.background);
+      await this._scene.init(
+        this._config.three_cdn,
+        this._config.background,
+        this._config
+      );
       await this._scene.loadModel(this._config.model);
       if (this._config.camera) this._scene.applyCamera(this._config.camera);
       this._scene.setSprites(this._config.lights, this._config);

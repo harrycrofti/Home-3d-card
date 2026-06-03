@@ -122,7 +122,10 @@ camera:
 | `default_size` | number | `1` | Marker size multiplier for lights without their own `size`. `1` = auto-sized to the model; the per-light `size` scales relative to that. |
 | `camera` | map | _(auto-fit)_ | `{ position:[x,y,z], target:[x,y,z] }` starting view. |
 | `background` | colour | `#0d1016` | Scene background colour. |
-| `ambient_intensity` | number | `0.9` | Ambient light level for the model. |
+| `ambient_intensity` | number | `0.6` | Base fill light. Lower it for darker rooms so the cast light reads more; raise it for an evenly-lit "daylight" look. |
+| `cast_light` | bool | `true` | When on, each marker also casts a real light into the model when its entity is on (scaled by brightness). Set `false` for glow-only markers. |
+| `light_intensity` | number | `2` | Brightness multiplier for the cast room light. |
+| `light_distance` | number | `0.45` | How far each light reaches, as a fraction of the model's size. |
 | `three_cdn` | url | `https://esm.sh` | Where to load three.js from. Change to self-host for offline dashboards. |
 
 ---
