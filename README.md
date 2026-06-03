@@ -135,6 +135,10 @@ Map a ceiling-fan **object in the model** to a `fan.*` entity so it spins when o
 4. Spin speed follows the fan's `percentage` (so speed 1/2/3 → slow/medium/fast).
 5. Click an existing fan to re-select it; **🗑 Remove fan** deletes the mapping.
 
+Fans exported as **several parts** (housing + hub + blades) are auto-grouped:
+clicking one part gathers the adjacent parts so the whole fan spins together
+(structural geometry and large meshes are excluded from the group).
+
 **On the dashboard, tap a fan** to open a control popup with **Light on/off**,
 **Fan on/off**, and **speed − / +** (uses `fan.increase_speed`/`decrease_speed`).
 

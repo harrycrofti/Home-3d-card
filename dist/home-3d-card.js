@@ -365,15 +365,77 @@ class Home3DScene {
   }
 
   /**
-   * Rebuild spinning fan rigs. Each fan's object is re-parented under a pivot
-   * group at its bounding-box centre, so we can spin it around the world-up
-   * (Y) axis without it flying off around the model origin.
+   * Collect all mesh parts that make up one fan, starting from a clicked seed
+   * mesh. Many furniture models export as several meshes (housing, hub,
+   * blades); we grow the group by bounding-box adjacency so the whole fan spins
+   * together — while excluding structural geometry (walls/floors) and any mesh
+   * too large to be a fan part. Returns an array of node names.
+   */
+  _collectFanParts(seed) {
+    if (!seed || !this._modelRoot) return [];
+    const STRUCT = /^(wall|ground|floor|slab|room|ceiling_\d)/i;
+    const maxDim = this._modelMaxDim || 100;
+    const partCap = maxDim * 0.3; // a fan part is small vs. the whole house
+    const gap = maxDim * 0.01; // tolerate small gaps between parts
+    const candidates = [];
+    this._modelRoot.traverse((o) => {
+      if (!o.isMesh || !o.name || STRUCT.test(o.name)) return;
+      const b = new THREE.Box3().setFromObject(o);
+      const s = b.getSize(new THREE.Vector3());
+      if (Math.max(s.x, s.y, s.z) > partCap) return; // skip walls/ceilings/etc.
+      candidates.push({ o, box: b });
+    });
+    const chosen = new Set([seed]);
+    const groupBox = new THREE.Box3().setFromObject(seed);
+    let added = true;
+    let passes = 0;
+    while (added && passes < 8) {
+      added = false;
+      passes++;
+      const grown = groupBox.clone().expandByScalar(gap);
+      for (const c of candidates) {
+        if (chosen.has(c.o)) continue;
+        if (grown.intersectsBox(c.box)) {
+          chosen.add(c.o);
+          groupBox.union(c.box);
+          added = true;
+        }
+      }
+    }
+    return [...chosen].map((o) => o.name).filter(Boolean);
+  }
+
+  /** Resolve a fan's configured part names (or legacy single object). */
+  _resolveFanNodes(cf) {
+    const names =
+      cf.objects && cf.objects.length
+        ? cf.objects
+        : cf.object
+        ? [cf.object]
+        : [];
+    const nodes = [];
+    names.forEach((n) => {
+      const found = this._findObject(n, null);
+      if (found) nodes.push(found);
+    });
+    if (!nodes.length) {
+      const one = this._findObject(null, cf.position);
+      if (one) nodes.push(one);
+    }
+    return nodes;
+  }
+
+  /**
+   * Rebuild spinning fan rigs. All of a fan's parts are re-parented under one
+   * pivot at the clicked point (X/Z) and spun around the world-up (Y) axis.
    */
   setFans(fans, cfg) {
     this._fanCfg = cfg || {};
     // tear down previous rigs — return nodes to their original parents first
     for (const f of this.fans) {
-      if (f.node) (f.origParent || this._modelRoot).attach(f.node);
+      (f.nodes || []).forEach((n, idx) =>
+        (f.origParents[idx] || this._modelRoot).attach(n)
+      );
       if (f.pivot) this.scene.remove(f.pivot);
       if (f.lightObj) this.scene.remove(f.lightObj);
     }
@@ -385,22 +447,24 @@ class Home3DScene {
     const ref = distance * 0.5;
     const baseIntensity = ref * ref * (cfg.light_intensity ?? 2);
     (fans || []).forEach((cf) => {
-      const node = this._findObject(cf.object, cf.position);
+      const nodes = this._resolveFanNodes(cf);
       let pivot = null;
-      let origParent = null;
-      if (node) {
-        const center = new THREE.Box3()
-          .setFromObject(node)
-          .getCenter(new THREE.Vector3());
-        // Spin axis passes through the clicked point (X/Z) so an off-centre
-        // bounding box doesn't make the fan orbit/wobble. Click the hub.
+      const origParents = [];
+      if (nodes.length) {
+        const groupBox = new THREE.Box3();
+        nodes.forEach((n) => groupBox.expandByObject(n));
+        const center = groupBox.getCenter(new THREE.Vector3());
+        // Spin axis through the clicked point so an off-centre group doesn't
+        // orbit/wobble. Click the hub when placing.
         const ax = cf.position ? cf.position[0] : center.x;
         const az = cf.position ? cf.position[2] : center.z;
-        origParent = node.parent || this._modelRoot;
         pivot = new THREE.Group();
         pivot.position.set(ax, center.y, az);
         this.scene.add(pivot);
-        pivot.attach(node); // keeps world transform; spins around world-Y
+        nodes.forEach((n) => {
+          origParents.push(n.parent || this._modelRoot);
+          pivot.attach(n); // keeps world transform; spins around world-Y
+        });
       }
       // Optional integrated light (these fans have a light kit).
       let lightObj = null;
@@ -413,9 +477,9 @@ class Home3DScene {
       this.fans.push({
         entity: cf.entity,
         light: cf.light || "",
-        node,
+        nodes,
         pivot,
-        origParent,
+        origParents,
         lightObj,
         baseIntensity,
         speed: 0, // current angular velocity (rad/s)
@@ -451,11 +515,10 @@ class Home3DScene {
 
   _fanIndexForObject(obj) {
     for (let i = 0; i < this.fans.length; i++) {
-      const node = this.fans[i].node;
-      if (!node) continue;
+      const nodes = this.fans[i].nodes || [];
       let o = obj;
       while (o) {
-        if (o === node) return i;
+        if (nodes.indexOf(o) >= 0) return i;
         o = o.parent;
       }
     }
@@ -530,8 +593,14 @@ class Home3DScene {
       // EDIT mode
       if (this._placingFan) {
         const hit = this._raycastModelHit();
-        if (hit && this.onPlaceFan)
-          this.onPlaceFan({ name: hit.object.name, point: hit.point });
+        if (hit && this.onPlaceFan) {
+          const names = this._collectFanParts(hit.object);
+          this.onPlaceFan({
+            seed: hit.object.name,
+            names,
+            point: hit.point,
+          });
+        }
         this.setPlacingFan(false);
         return;
       }
@@ -693,7 +762,7 @@ class Home3DCard extends HTMLElement {
         (e) => this._stateFor(e)
       );
     }
-    if (this._popupFan != null) this._renderFanPopup();
+    if (this._popupFan != null) this._refreshFanPopup();
   }
 
   async _build() {
@@ -794,18 +863,21 @@ class Home3DCard extends HTMLElement {
     const pop = this.shadowRoot.getElementById("popup");
     if (back) back.classList.add("show");
     if (pop) pop.classList.add("show");
-    this._renderFanPopup();
+    this._buildFanPopup(); // structure + listeners ONCE per open
+    this._refreshFanPopup(); // fill in live state
   }
 
   _hideFanPopup() {
     this._popupFan = null;
+    this._popEls = null;
     const back = this.shadowRoot.getElementById("pop-back");
     const pop = this.shadowRoot.getElementById("popup");
     if (back) back.classList.remove("show");
     if (pop) pop.classList.remove("show");
   }
 
-  _renderFanPopup() {
+  /** Build the popup DOM + attach listeners once (no rebuild on hass ticks). */
+  _buildFanPopup() {
     const pop = this.shadowRoot.getElementById("popup");
     if (!pop || this._popupFan == null) return;
     const cf = this._config.fans[this._popupFan];
@@ -813,38 +885,66 @@ class Home3DCard extends HTMLElement {
       this._hideFanPopup();
       return;
     }
+    let rows = "";
+    if (cf.light)
+      rows += `<div class="row"><button data-act="light" id="pf-light"></button></div>`;
+    if (cf.entity)
+      rows += `<div class="row"><button data-act="fan" id="pf-fan"></button></div>
+        <div class="row">
+          <button class="icon" data-act="down">－</button>
+          <span class="spd" id="pf-spd"></span>
+          <button class="icon" data-act="up">＋</button>
+        </div>`;
+    pop.innerHTML = `<button class="close" data-act="close">✕</button>
+      <div class="title" id="pf-title">Fan</div>${rows}`;
+
+    // Attach listeners once. Using a stored handler avoids duplicates.
+    pop.querySelectorAll("button[data-act]").forEach((b) =>
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._fanAction(b.dataset.act);
+      })
+    );
+    this._popEls = {
+      title: pop.querySelector("#pf-title"),
+      light: pop.querySelector("#pf-light"),
+      fan: pop.querySelector("#pf-fan"),
+      spd: pop.querySelector("#pf-spd"),
+    };
+  }
+
+  /** Update labels/state in place (cheap, runs on every hass tick). */
+  _refreshFanPopup() {
+    if (!this._popEls || this._popupFan == null) return;
+    const cf = this._config.fans[this._popupFan];
+    if (!cf) {
+      this._hideFanPopup();
+      return;
+    }
     const fan = cf.entity ? this._stateRaw(cf.entity) : null;
     const light = cf.light ? this._stateRaw(cf.light) : null;
-    const fanOn = fan && fan.state === "on";
-    const pct = fan && fan.attributes ? fan.attributes.percentage : null;
-    const lightOn = light && light.state === "on";
-    const name =
-      (fan && fan.attributes && fan.attributes.friendly_name) ||
-      (light && light.attributes && light.attributes.friendly_name) ||
-      "Fan";
-
-    let rows = "";
-    if (cf.light) {
-      rows += `<div class="row">
-        <button class="${lightOn ? "on" : ""}" data-act="light">💡 Light ${lightOn ? "On" : "Off"}</button>
-      </div>`;
+    const e = this._popEls;
+    if (e.title) {
+      e.title.textContent =
+        (fan && fan.attributes && fan.attributes.friendly_name) ||
+        (light && light.attributes && light.attributes.friendly_name) ||
+        "Fan";
     }
-    if (cf.entity) {
-      rows += `<div class="row">
-        <button class="${fanOn ? "on" : ""}" data-act="fan">🌀 Fan ${fanOn ? "On" : "Off"}</button>
-      </div>
-      <div class="row">
-        <button class="icon" data-act="down">－</button>
-        <span class="spd">${fanOn ? (pct != null ? pct + "%" : "On") : "Off"}</span>
-        <button class="icon" data-act="up">＋</button>
-      </div>`;
+    if (e.light) {
+      const on = light && light.state === "on";
+      e.light.textContent = `💡 Light ${on ? "On" : "Off"}`;
+      e.light.classList.toggle("on", !!on);
     }
-    pop.innerHTML = `<button class="close" data-act="close">✕</button>
-      <div class="title">${name}</div>${rows}`;
-
-    pop.querySelectorAll("button[data-act]").forEach((b) =>
-      b.addEventListener("click", () => this._fanAction(b.dataset.act))
-    );
+    if (e.fan) {
+      const on = fan && fan.state === "on";
+      e.fan.textContent = `🌀 Fan ${on ? "On" : "Off"}`;
+      e.fan.classList.toggle("on", !!on);
+    }
+    if (e.spd) {
+      const on = fan && fan.state === "on";
+      const pct = fan && fan.attributes ? fan.attributes.percentage : null;
+      e.spd.textContent = on ? (pct != null ? pct + "%" : "On") : "Off";
+    }
   }
 
   _stateRaw(entity) {
@@ -1234,7 +1334,8 @@ class Home3DCardEditor extends HTMLElement {
   _addFanAt(hit) {
     const fan = {
       entity: "",
-      object: hit.name || "",
+      object: hit.seed || "",
+      objects: hit.names && hit.names.length ? hit.names : undefined,
       position: [round(hit.point.x), round(hit.point.y), round(hit.point.z)],
     };
     this._config.fans.push(fan);
@@ -1262,8 +1363,9 @@ class Home3DCardEditor extends HTMLElement {
     this.shadowRoot.getElementById("fan-pick").value = f.entity || "";
     this.shadowRoot.getElementById("fan-light").value = f.light || "";
     this.shadowRoot.getElementById("fan-reverse").checked = !!f.reverse;
-    this.shadowRoot.getElementById("fan-obj").textContent = f.object
-      ? `Object: ${f.object}`
+    const parts = f.objects && f.objects.length ? f.objects.length : f.object ? 1 : 0;
+    this.shadowRoot.getElementById("fan-obj").textContent = parts
+      ? `${parts} part${parts > 1 ? "s" : ""} grouped (${f.object || "?"})`
       : "Object: (matched by position)";
   }
 
