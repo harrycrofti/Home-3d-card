@@ -778,29 +778,29 @@ class Home3DCard extends HTMLElement {
           justify-content:center; text-align:center; padding:16px;
           color: var(--secondary-text-color,#9aa0a6); font-size:0.9rem;
         }
-        .pop-back { position:absolute; inset:0; display:none; z-index:5; }
+        .pop-back { position:absolute; inset:0; display:none; z-index:30;
+          background:rgba(0,0,0,0.18); }
         .pop-back.show { display:block; }
         .popup {
-          position:absolute; z-index:6; left:50%; bottom:12px;
+          position:absolute; z-index:31; left:50%; bottom:14px;
           transform:translateX(-50%);
-          background: rgba(20,24,32,0.96); color:#fff;
-          border:1px solid rgba(255,255,255,0.14); border-radius:14px;
-          padding:10px 12px; min-width:210px; display:none;
-          box-shadow:0 8px 30px rgba(0,0,0,0.5); backdrop-filter:blur(8px);
+          background: rgba(20,24,32,0.98); color:#fff;
+          border:1px solid rgba(255,255,255,0.16); border-radius:14px;
+          padding:12px; min-width:240px; max-width:92%; display:none;
+          box-shadow:0 10px 34px rgba(0,0,0,0.55); pointer-events:auto;
         }
         .popup.show { display:block; }
-        .popup .title { font-size:0.8rem; font-weight:700; margin-bottom:8px; opacity:0.9; }
-        .popup .row { display:flex; gap:8px; align-items:center; margin-top:6px; }
-        .popup button {
-          flex:1; background: rgba(255,255,255,0.08); color:#fff; cursor:pointer;
-          border:1px solid rgba(255,255,255,0.14); border-radius:9px;
-          padding:9px 8px; font-size:0.85rem;
-        }
-        .popup button.on { background: var(--primary-color,#3b82f6); border-color:transparent; }
-        .popup button.icon { flex:0 0 44px; font-size:1.1rem; }
-        .popup .spd { flex:1; text-align:center; font-weight:700; font-size:0.9rem; }
-        .popup .close { position:absolute; top:6px; right:8px; background:none;
-          border:none; color:#aaa; font-size:1rem; padding:2px 6px; flex:none; }
+        .popup .phead { display:flex; align-items:center; justify-content:space-between;
+          gap:10px; margin-bottom:8px; }
+        .popup .ptitle { font-size:0.9rem; font-weight:700; }
+        .popup .row { display:flex; gap:8px; align-items:center; margin-top:8px; }
+        .popup button { color:#fff; cursor:pointer; font-family:inherit;
+          background: rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.16); }
+        .popup button.act { flex:1; min-height:48px; border-radius:10px; font-size:0.9rem; }
+        .popup button.act.on { background: var(--primary-color,#3b82f6); border-color:transparent; }
+        .popup button.spdbtn { flex:0 0 60px; min-height:48px; font-size:1.4rem; border-radius:10px; }
+        .popup button.pclose { width:36px; height:36px; flex:none; border-radius:9px; font-size:1rem; }
+        .popup .spd { flex:1; text-align:center; font-weight:700; font-size:1rem; }
       </style>
       <ha-card>
         <div class="wrap">
@@ -816,6 +816,10 @@ class Home3DCard extends HTMLElement {
     root.getElementById("pop-back").addEventListener("pointerdown", () =>
       this._hideFanPopup()
     );
+    // Keep popup interactions from reaching the backdrop / 3D canvas.
+    root
+      .getElementById("popup")
+      .addEventListener("pointerdown", (e) => e.stopPropagation());
     if (this._scene) this._scene.dispose();
     this._ready = false;
     this._popupFan = null;
@@ -887,24 +891,28 @@ class Home3DCard extends HTMLElement {
     }
     let rows = "";
     if (cf.light)
-      rows += `<div class="row"><button data-act="light" id="pf-light"></button></div>`;
+      rows += `<div class="row"><button class="act" data-act="light" id="pf-light">💡 Light</button></div>`;
     if (cf.entity)
-      rows += `<div class="row"><button data-act="fan" id="pf-fan"></button></div>
+      rows += `<div class="row"><button class="act" data-act="fan" id="pf-fan">🌀 Fan</button></div>
         <div class="row">
-          <button class="icon" data-act="down">－</button>
-          <span class="spd" id="pf-spd"></span>
-          <button class="icon" data-act="up">＋</button>
+          <button class="spdbtn" data-act="down">－</button>
+          <span class="spd" id="pf-spd">—</span>
+          <button class="spdbtn" data-act="up">＋</button>
         </div>`;
-    pop.innerHTML = `<button class="close" data-act="close">✕</button>
-      <div class="title" id="pf-title">Fan</div>${rows}`;
+    pop.innerHTML = `
+      <div class="phead">
+        <span class="ptitle" id="pf-title">Fan</span>
+        <button class="pclose" data-act="close">✕</button>
+      </div>${rows}`;
 
-    // Attach listeners once. Using a stored handler avoids duplicates.
-    pop.querySelectorAll("button[data-act]").forEach((b) =>
+    pop.querySelectorAll("button[data-act]").forEach((b) => {
+      const act = b.dataset.act;
       b.addEventListener("click", (e) => {
+        e.preventDefault();
         e.stopPropagation();
-        this._fanAction(b.dataset.act);
-      })
-    );
+        this._fanAction(act);
+      });
+    });
     this._popEls = {
       title: pop.querySelector("#pf-title"),
       light: pop.querySelector("#pf-light"),
