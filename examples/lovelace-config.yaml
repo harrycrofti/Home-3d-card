@@ -28,5 +28,16 @@ lights:
   - entity: light.bedroom
     position: [340, 240, 210]
 
+# Fans: a model object spins when the fan entity is on; speed follows the fan's
+# percentage (e.g. 33/66/100 → slow/medium/fast). Easiest to add via the editor
+# (🌀 Add fan, then click the fan in the model). `object` is the GLB node name.
+fans:
+  - entity: fan.office_switch
+    object: Ceiling_lamp_034_2141   # the node clicked in the editor
+    position: [120, 250, -80]
+    # reverse: true                 # spin the other way if needed
+# fan_min_speed: 1.5                 # rad/s at lowest percentage
+# fan_max_speed: 11                  # rad/s at 100%
+
 # If your dashboards are viewed offline, self-host three.js and set:
 # three_cdn: /local/three

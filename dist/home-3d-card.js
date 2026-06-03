@@ -69,6 +69,10 @@ const DEFAULTS = {
   light_intensity: 2, // brightness multiplier for the cast room light
   light_distance: 0.45, // light reach as a fraction of the model's size
   lights: [], // [{ entity, position:[x,y,z], color?, size? }]
+  // Fans: spin a model object when the fan entity is on; speed ∝ percentage.
+  fans: [], // [{ entity, object: <node name>, position:[x,y,z], reverse? }]
+  fan_min_speed: 1.5, // rad/s at lowest non-zero percentage
+  fan_max_speed: 11, // rad/s at 100%
   camera: undefined, // { position:[x,y,z], target:[x,y,z] }
 };
 
@@ -106,18 +110,25 @@ class Home3DScene {
     this.container = container;
     this.interactive = !!opts.interactive; // edit mode = true
     this.sprites = []; // [{ entity, color, size, position:[x,y,z], object }]
+    this.fans = []; // [{ entity, node, pivot, origParent, speed, target, reverse }]
     this._glowTex = null;
     this._raf = null;
     this._disposed = false;
     this._modelRoot = null;
+    this._lastTime = 0;
+    this._fanCfg = {};
 
     // callbacks wired by the host
     this.onTapSprite = null; // (spriteIndex) => void   (view mode)
+    this.onTapFan = null; // (fanIndex) => void          (view mode)
     this.onPlace = null; // (point Vector3) => void       (edit: add light)
+    this.onPlaceFan = null; // ({name, point}) => void    (edit: add fan)
     this.onSelect = null; // (spriteIndex|null) => void    (edit)
+    this.onSelectFan = null; // (fanIndex) => void         (edit)
     this.onMove = null; // (spriteIndex, point) => void    (edit: drag)
 
     this._placing = false;
+    this._placingFan = false;
     this._dragIndex = -1;
     this._selectedIndex = -1;
   }
@@ -322,10 +333,116 @@ class Home3DScene {
     });
   }
 
+  /* ---- fans ---- */
+
+  /** Find a model object by its node name; fall back to smallest mesh at pos. */
+  _findObject(name, pos) {
+    if (!this._modelRoot) return null;
+    let byName = null;
+    if (name) {
+      this._modelRoot.traverse((o) => {
+        if (!byName && o.name === name) byName = o;
+      });
+      if (byName) return byName;
+    }
+    if (!pos) return null;
+    const p = new THREE.Vector3(pos[0], pos[1], pos[2]);
+    const box = new THREE.Box3();
+    let best = null;
+    let bestVol = Infinity;
+    this._modelRoot.traverse((o) => {
+      if (!o.isMesh) return;
+      box.setFromObject(o);
+      if (!box.containsPoint(p)) return;
+      const s = box.getSize(new THREE.Vector3());
+      const vol = s.x * s.y * s.z;
+      if (vol < bestVol) {
+        bestVol = vol;
+        best = o;
+      }
+    });
+    return best;
+  }
+
+  /**
+   * Rebuild spinning fan rigs. Each fan's object is re-parented under a pivot
+   * group at its bounding-box centre, so we can spin it around the world-up
+   * (Y) axis without it flying off around the model origin.
+   */
+  setFans(fans, cfg) {
+    this._fanCfg = cfg || {};
+    // tear down previous rigs — return nodes to their original parents first
+    for (const f of this.fans) {
+      if (f.pivot && f.node) {
+        (f.origParent || this._modelRoot).attach(f.node);
+        this.scene.remove(f.pivot);
+      }
+    }
+    this.fans = [];
+    if (!this._modelRoot) return;
+    (fans || []).forEach((cf) => {
+      const node = this._findObject(cf.object, cf.position);
+      if (!node) {
+        this.fans.push({ entity: cf.entity, node: null, pivot: null, speed: 0, target: 0 });
+        return;
+      }
+      const center = new THREE.Box3()
+        .setFromObject(node)
+        .getCenter(new THREE.Vector3());
+      const origParent = node.parent || this._modelRoot;
+      const pivot = new THREE.Group();
+      pivot.position.copy(center);
+      this.scene.add(pivot);
+      pivot.attach(node); // keeps world transform; spins around world-Y at centre
+      this.fans.push({
+        entity: cf.entity,
+        node,
+        pivot,
+        origParent,
+        speed: 0, // current angular velocity (rad/s)
+        target: 0, // desired angular velocity
+        reverse: !!cf.reverse,
+      });
+    });
+  }
+
+  /** getFan(entity) => { on, percent:0..1 }. Sets each fan's target speed. */
+  updateFanStates(getFan) {
+    const cfg = this._fanCfg || {};
+    const min = cfg.fan_min_speed ?? 1.5;
+    const max = cfg.fan_max_speed ?? 11;
+    for (const f of this.fans) {
+      const st = f.entity ? getFan(f.entity) : { on: false, percent: 0 };
+      const on = !!(st && st.on);
+      const pct = on ? clamp(st.percent ?? 1, 0, 1) : 0;
+      let t = on ? min + (max - min) * pct : 0;
+      if (f.reverse) t = -t;
+      f.target = t;
+    }
+  }
+
+  _fanIndexForObject(obj) {
+    for (let i = 0; i < this.fans.length; i++) {
+      const node = this.fans[i].node;
+      if (!node) continue;
+      let o = obj;
+      while (o) {
+        if (o === node) return i;
+        o = o.parent;
+      }
+    }
+    return -1;
+  }
+
   /* ---- pointer / raycasting ---- */
 
   setPlacing(on) {
     this._placing = on;
+    this.renderer.domElement.style.cursor = on ? "crosshair" : "";
+  }
+
+  setPlacingFan(on) {
+    this._placingFan = on;
     this.renderer.domElement.style.cursor = on ? "crosshair" : "";
   }
 
@@ -343,11 +460,22 @@ class Home3DScene {
     return objs.indexOf(hits[0].object);
   }
 
-  _raycastModel() {
-    if (!this._modelRoot) return null;
+  /** First real mesh under the pointer (skips glow sprites). Scene-wide, so it
+   *  also hits fan objects that have been re-parented under pivot groups. */
+  _raycastModelHit() {
     this._raycaster.setFromCamera(this._pointer, this.camera);
-    const hits = this._raycaster.intersectObject(this._modelRoot, true);
-    return hits.length ? hits[0].point.clone() : null;
+    const hits = this._raycaster.intersectObjects(this.scene.children, true);
+    for (const h of hits) {
+      const o = h.object;
+      if (o.isSprite || (o.userData && o.userData.isLightSprite)) continue;
+      if (o.isMesh) return { object: o, point: h.point.clone() };
+    }
+    return null;
+  }
+
+  _raycastModel() {
+    const hit = this._raycastModelHit();
+    return hit ? hit.point : null;
   }
 
   _bindPointer() {
@@ -358,12 +486,27 @@ class Home3DScene {
       const spriteIdx = this._raycastSprites();
 
       if (!this.interactive) {
-        // VIEW mode: tap a light → toggle
-        if (spriteIdx >= 0 && this.onTapSprite) this.onTapSprite(spriteIdx);
+        // VIEW mode: tap a light → toggle; else maybe a fan → toggle
+        if (spriteIdx >= 0 && this.onTapSprite) {
+          this.onTapSprite(spriteIdx);
+          return;
+        }
+        const hit = this._raycastModelHit();
+        if (hit) {
+          const fi = this._fanIndexForObject(hit.object);
+          if (fi >= 0 && this.onTapFan) this.onTapFan(fi);
+        }
         return;
       }
 
       // EDIT mode
+      if (this._placingFan) {
+        const hit = this._raycastModelHit();
+        if (hit && this.onPlaceFan)
+          this.onPlaceFan({ name: hit.object.name, point: hit.point });
+        this.setPlacingFan(false);
+        return;
+      }
       if (this._placing) {
         const pt = this._raycastModel();
         if (pt && this.onPlace) this.onPlace(pt);
@@ -376,9 +519,15 @@ class Home3DScene {
         this.controls.enabled = false;
         this.highlight(spriteIdx);
         if (this.onSelect) this.onSelect(spriteIdx);
+      } else {
+        // Clicked a model object that's a registered fan → select it.
+        const hit = this._raycastModelHit();
+        if (hit) {
+          const fi = this._fanIndexForObject(hit.object);
+          if (fi >= 0 && this.onSelectFan) this.onSelectFan(fi);
+        }
       }
-      // Clicking empty space keeps the current selection (so the adjust panel
-      // stays open) and lets OrbitControls rotate/pan the view.
+      // Otherwise selection is kept and OrbitControls rotates/pans the view.
     });
 
     el.addEventListener("pointermove", (ev) => {
@@ -406,6 +555,17 @@ class Home3DScene {
   _animate() {
     if (this._disposed) return;
     this._raf = requestAnimationFrame(() => this._animate());
+    const now =
+      typeof performance !== "undefined" ? performance.now() : this._lastTime + 16;
+    let dt = (now - (this._lastTime || now)) / 1000;
+    this._lastTime = now;
+    if (dt > 0.1) dt = 0.1; // clamp after tab was backgrounded
+    // Spin fans: ease current speed toward target, then advance rotation.
+    for (const f of this.fans) {
+      if (!f.pivot) continue;
+      f.speed += (f.target - f.speed) * Math.min(1, dt * 3);
+      if (Math.abs(f.speed) > 1e-4) f.pivot.rotation.y += f.speed * dt;
+    }
     if (this.controls) this.controls.update();
     if (this.renderer) this.renderer.render(this.scene, this.camera);
   }
@@ -445,21 +605,28 @@ class Home3DCard extends HTMLElement {
   }
 
   static getStubConfig() {
-    return { type: "custom:home-3d-card", model: "/local/home.glb", lights: [] };
+    return {
+      type: "custom:home-3d-card",
+      model: "/local/home.glb",
+      lights: [],
+      fans: [],
+    };
   }
 
   setConfig(config) {
     if (!config) throw new Error("Invalid configuration");
     const incoming = { ...DEFAULTS, ...config };
     if (!incoming.lights) incoming.lights = [];
+    if (!incoming.fans) incoming.fans = [];
     const modelChanged =
       !this._scene || incoming.model !== (this._config && this._config.model);
     this._config = incoming;
     if (modelChanged) {
       this._build(); // first build, or model path changed → (re)load scene
     } else if (this._ready) {
-      // Only lights/appearance changed → refresh markers without reloading.
+      // Only lights/fans/appearance changed → refresh without reloading.
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setFans(this._config.fans, this._config);
       this._applyStates();
     }
   }
@@ -481,9 +648,18 @@ class Home3DCard extends HTMLElement {
     return { on, brightness: b != null ? b / 255 : 1 };
   }
 
+  _fanStateFor(entity) {
+    const st = this._hass && this._hass.states[entity];
+    if (!st) return { on: false, percent: 0 };
+    const on = st.state === "on";
+    const pct = st.attributes && st.attributes.percentage;
+    return { on, percent: pct != null ? pct / 100 : 1 };
+  }
+
   _applyStates() {
     if (this._scene && this._ready) {
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateFanStates((e) => this._fanStateFor(e));
     }
   }
 
@@ -526,6 +702,12 @@ class Home3DCard extends HTMLElement {
         this._hass.callService("light", "toggle", { entity_id: s.entity });
       }
     };
+    this._scene.onTapFan = (i) => {
+      const f = this._scene.fans[i];
+      if (f && f.entity && this._hass) {
+        this._hass.callService("fan", "toggle", { entity_id: f.entity });
+      }
+    };
 
     try {
       await this._scene.init(
@@ -536,6 +718,7 @@ class Home3DCard extends HTMLElement {
       await this._scene.loadModel(this._config.model);
       if (this._config.camera) this._scene.applyCamera(this._config.camera);
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setFans(this._config.fans, this._config);
       this._ready = true;
       msg.style.display = "none";
       this._applyStates();
@@ -566,12 +749,14 @@ class Home3DCardEditor extends HTMLElement {
     this._scene = null;
     this._ready = false;
     this._selected = -1;
+    this._selectedFan = -1;
     this._built = false;
   }
 
   setConfig(config) {
     const incoming = { ...DEFAULTS, ...config };
     if (!incoming.lights) incoming.lights = [];
+    if (!incoming.fans) incoming.fans = [];
 
     // HA echoes our own config-changed back by calling setConfig again. If it
     // matches what we already have, swallow it — otherwise every placed light
@@ -592,17 +777,21 @@ class Home3DCardEditor extends HTMLElement {
     if (!this._built || modelChanged) {
       this._build(); // first build, or model path changed → (re)load scene
     } else if (this._scene && this._ready) {
-      // Only lights/appearance changed externally → refresh markers in place.
+      // Only lights/fans/appearance changed externally → refresh in place.
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setFans(this._config.fans, this._config);
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateFanStates((e) => this._fanStateFor(e));
     }
   }
 
   set hass(hass) {
     this._hass = hass;
     this._fillEntityPicker();
+    this._fillFanPicker();
     if (this._scene && this._ready) {
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateFanStates((e) => this._fanStateFor(e));
     }
   }
 
@@ -614,6 +803,18 @@ class Home3DCardEditor extends HTMLElement {
       brightness:
         st.attributes && st.attributes.brightness != null
           ? st.attributes.brightness / 255
+          : 1,
+    };
+  }
+
+  _fanStateFor(entity) {
+    const st = this._hass && this._hass.states[entity];
+    if (!st) return { on: false, percent: 0 };
+    return {
+      on: st.state === "on",
+      percent:
+        st.attributes && st.attributes.percentage != null
+          ? st.attributes.percentage / 100
           : 1,
     };
   }
@@ -642,6 +843,27 @@ class Home3DCardEditor extends HTMLElement {
       `<option value="">— pick a light entity —</option>` +
       this._lightEntities()
         .map((e) => `<option value="${e}">${e}</option>`)
+        .join("");
+  }
+
+  _fanEntities() {
+    if (!this._hass) return [];
+    return Object.keys(this._hass.states)
+      .filter((e) => e.startsWith("fan."))
+      .sort();
+  }
+
+  _fillFanPicker() {
+    const sel = this.shadowRoot.getElementById("fan-pick");
+    if (!sel || sel.childElementCount) return;
+    sel.innerHTML =
+      `<option value="">— pick a fan entity —</option>` +
+      this._fanEntities()
+        .map((e) => {
+          const fn =
+            (this._hass.states[e].attributes || {}).friendly_name || e;
+          return `<option value="${e}">${fn}</option>`;
+        })
         .join("");
   }
 
@@ -686,15 +908,16 @@ class Home3DCardEditor extends HTMLElement {
 
       <div class="toolbar">
         <button id="add">➕ Add light</button>
+        <button id="addfan">🌀 Add fan</button>
         <button id="savecam">📷 Save view</button>
         <span class="hint" id="placehint"></span>
       </div>
-      <div class="hint">Click <b>Add light</b>, then click on the model to drop a marker. Click a marker to select it; drag to reposition.</div>
+      <div class="hint"><b>Add light</b> → click a spot on the model. <b>Add fan</b> → click the fan object. Click a marker/fan to select it; drag a marker to reposition.</div>
 
       <div class="sel" id="sel" hidden>
         <div class="grid2">
           <label class="f">
-            <span>Entity</span>
+            <span>Light entity</span>
             <select id="entity-pick"></select>
           </label>
           <label class="f">
@@ -710,6 +933,24 @@ class Home3DCardEditor extends HTMLElement {
             <button id="del">🗑 Delete light</button>
           </label>
         </div>
+      </div>
+
+      <div class="sel" id="fansel" hidden>
+        <div class="grid2">
+          <label class="f">
+            <span>Fan entity</span>
+            <select id="fan-pick"></select>
+          </label>
+          <label class="f" style="flex-direction:row; align-items:center; gap:8px;">
+            <input type="checkbox" id="fan-reverse" />
+            <span>Reverse spin</span>
+          </label>
+          <label class="f" style="justify-content:flex-end;">
+            <span>&nbsp;</span>
+            <button id="fan-del">🗑 Remove fan</button>
+          </label>
+        </div>
+        <div class="hint" id="fan-obj"></div>
       </div>
     `;
     this._built = true; // DOM exists; future setConfig echoes won't rebuild
@@ -730,6 +971,13 @@ class Home3DCardEditor extends HTMLElement {
           "Now click a spot on the model…";
       }
     });
+    root.getElementById("addfan").addEventListener("click", () => {
+      if (this._scene) {
+        this._scene.setPlacingFan(true);
+        root.getElementById("placehint").textContent =
+          "Now click the fan object on the model…";
+      }
+    });
     root.getElementById("savecam").addEventListener("click", () => {
       if (this._scene) {
         this._config.camera = this._scene.getCamera();
@@ -738,7 +986,9 @@ class Home3DCardEditor extends HTMLElement {
     });
 
     this._wireSelectionPanel();
+    this._wireFanPanel();
     this._fillEntityPicker();
+    this._fillFanPicker();
 
     // build scene
     const stage = root.getElementById("stage");
@@ -753,7 +1003,9 @@ class Home3DCardEditor extends HTMLElement {
 
     this._scene = new Home3DScene(stage, { interactive: true });
     this._scene.onPlace = (pt) => this._addLightAt(pt);
+    this._scene.onPlaceFan = (hit) => this._addFanAt(hit);
     this._scene.onSelect = (i) => this._selectLight(i);
+    this._scene.onSelectFan = (i) => this._selectFan(i);
     this._scene.onMove = (i, pos) => {
       this._config.lights[i].position = pos;
       this._emit();
@@ -768,9 +1020,11 @@ class Home3DCardEditor extends HTMLElement {
       await this._scene.loadModel(this._config.model);
       if (this._config.camera) this._scene.applyCamera(this._config.camera);
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setFans(this._config.fans, this._config);
       this._ready = true;
       msg.style.display = "none";
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateFanStates((e) => this._fanStateFor(e));
     } catch (err) {
       msg.textContent = `Failed to load 3D scene: ${err && err.message ? err.message : err}`;
       // eslint-disable-next-line no-console
@@ -795,6 +1049,8 @@ class Home3DCardEditor extends HTMLElement {
 
   _selectLight(i) {
     this._selected = i == null ? -1 : i;
+    this.shadowRoot.getElementById("fansel").hidden = true; // hide fan panel
+    this._selectedFan = -1;
     const panel = this.shadowRoot.getElementById("sel");
     if (this._selected < 0) {
       panel.hidden = true;
@@ -807,6 +1063,38 @@ class Home3DCardEditor extends HTMLElement {
       l.color || this._config.default_glow_color;
     this.shadowRoot.getElementById("size").value =
       l.size || this._config.default_size;
+  }
+
+  _addFanAt(hit) {
+    const fan = {
+      entity: "",
+      object: hit.name || "",
+      position: [round(hit.point.x), round(hit.point.y), round(hit.point.z)],
+    };
+    this._config.fans.push(fan);
+    this._emit();
+    this._scene.setFans(this._config.fans, this._config);
+    this._scene.updateFanStates((e) => this._fanStateFor(e));
+    this._selectFan(this._config.fans.length - 1);
+    this.shadowRoot.getElementById("placehint").textContent = "";
+  }
+
+  _selectFan(i) {
+    this._selectedFan = i == null ? -1 : i;
+    this.shadowRoot.getElementById("sel").hidden = true; // hide light panel
+    this._selected = -1;
+    const panel = this.shadowRoot.getElementById("fansel");
+    if (this._selectedFan < 0) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    const f = this._config.fans[this._selectedFan];
+    this.shadowRoot.getElementById("fan-pick").value = f.entity || "";
+    this.shadowRoot.getElementById("fan-reverse").checked = !!f.reverse;
+    this.shadowRoot.getElementById("fan-obj").textContent = f.object
+      ? `Object: ${f.object}`
+      : "Object: (matched by position)";
   }
 
   _wireSelectionPanel() {
@@ -842,6 +1130,31 @@ class Home3DCardEditor extends HTMLElement {
     });
   }
 
+  _wireFanPanel() {
+    const root = this.shadowRoot;
+    root.getElementById("fan-pick").addEventListener("change", (e) => {
+      if (this._selectedFan < 0) return;
+      this._config.fans[this._selectedFan].entity = e.target.value;
+      this._emit();
+      this._scene.updateFanStates((en) => this._fanStateFor(en));
+    });
+    root.getElementById("fan-reverse").addEventListener("change", (e) => {
+      if (this._selectedFan < 0) return;
+      this._config.fans[this._selectedFan].reverse = e.target.checked;
+      this._emit();
+      this._scene.setFans(this._config.fans, this._config);
+      this._scene.updateFanStates((en) => this._fanStateFor(en));
+    });
+    root.getElementById("fan-del").addEventListener("click", () => {
+      if (this._selectedFan < 0) return;
+      this._config.fans.splice(this._selectedFan, 1);
+      this._emit();
+      this._scene.setFans(this._config.fans, this._config);
+      this._selectFan(null);
+      this._scene.updateFanStates((en) => this._fanStateFor(en));
+    });
+  }
+
   disconnectedCallback() {
     if (this._scene) this._scene.dispose();
   }
@@ -855,7 +1168,7 @@ window.customCards.push({
   type: "home-3d-card",
   name: "Home 3D Card",
   description:
-    "A 3D dollhouse view of your home with tappable, glowing light entities.",
+    "A 3D dollhouse view of your home with tappable glowing lights and spinning fans bound to HA entities.",
   preview: false,
   documentationURL: "https://github.com/harrycrofti/home-3d-card",
 });

@@ -50,8 +50,21 @@ npx obj2gltf -i home.obj -o home.glb
 Alternative — **Blender**: `File → Import → Wavefront (.obj)`, then
 `File → Export → glTF 2.0 (.glb)` (embed textures / format = "glTF Binary").
 
-> Tip: keep the file small. A whole-house GLB should ideally be a few MB. If it's
-> huge, decimate meshes in Blender or skip high-poly furniture.
+### c2) Shrink it (recommended)
+
+A raw whole-house GLB is often 50–70 MB. Compress it — but **keep objects
+separate** so fans (and any future per-object effects) still work. Use
+[`@gltf-transform/cli`](https://gltf-transform.dev/):
+
+```bash
+npx @gltf-transform/cli optimize home.glb home.glb \
+  --compress meshopt --texture-compress webp --texture-size 1024 \
+  --flatten false --join false --instance false
+```
+
+This typically cuts the file ~80% (e.g. 68 MB → ~12 MB). **Do not** drop
+`--flatten false --join false` — without them the optimizer merges all furniture
+into one mesh and individual fans can no longer be spun.
 
 ### d) Put it where HA can serve it
 
@@ -110,6 +123,22 @@ camera:
 5. **📷 Save view** stores the current camera angle as the default.
 6. Everything is written back to the card's YAML automatically.
 
+### Spinning fans
+
+Map a ceiling-fan **object in the model** to a `fan.*` entity so it spins when on:
+
+1. Click **🌀 Add fan**, then click the fan object in the model.
+2. Pick the **fan entity** from the dropdown; optionally tick **Reverse spin**.
+3. The object now spins whenever the entity is on, with speed following the
+   fan's `percentage` (so speed 1/2/3 → slow/medium/fast). Tapping a fan on the
+   dashboard toggles it.
+4. Click an existing fan to re-select it; **🗑 Remove fan** deletes the mapping.
+
+> **Model requirement:** the fan must be a *separate object* in the GLB. The
+> `optimize` command's `--join`/`--flatten` steps merge everything into one mesh
+> and break this — export with **`--flatten false --join false`** (see the GLB
+> step above) so each piece of furniture stays individually addressable.
+
 ---
 
 ## Options
@@ -118,6 +147,9 @@ camera:
 |---|---|---|---|
 | `model` | path | _(none)_ | `/local/…glb` model of your home. **Required.** |
 | `lights` | list | `[]` | Light markers: each `{ entity, position:[x,y,z], color?, size? }`. |
+| `fans` | list | `[]` | Spinning fans: each `{ entity, object:"<node name>", position:[x,y,z], reverse? }`. The model object spins when the fan is on; speed follows the fan's `percentage`. |
+| `fan_min_speed` | number | `1.5` | Spin speed (rad/s) at the lowest non-zero fan percentage. |
+| `fan_max_speed` | number | `11` | Spin speed (rad/s) at 100%. |
 | `default_glow_color` | colour | `#ffd27f` | Glow colour for lights without their own `color`. |
 | `default_size` | number | `1` | Marker size multiplier for lights without their own `size`. `1` = auto-sized to the model; the per-light `size` scales relative to that. |
 | `camera` | map | _(auto-fit)_ | `{ position:[x,y,z], target:[x,y,z] }` starting view. |
