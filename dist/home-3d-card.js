@@ -60,7 +60,7 @@ const DEFAULTS = {
   model: undefined, // "/local/home.glb"
   three_cdn: DEFAULT_CDN,
   default_glow_color: "#ffd27f",
-  default_size: 0.35, // sprite radius in model (world) units
+  default_size: 1, // marker size multiplier (×) of the model-relative base size
   ambient_intensity: 0.9,
   background: "#0d1016",
   lights: [], // [{ entity, position:[x,y,z], color?, size? }]
@@ -198,6 +198,9 @@ class Home3DScene {
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z) || 5;
+    // Base marker size derived from the model so sprites are visible/tappable
+    // regardless of the model's unit scale (SH3D exports in centimetres).
+    this._baseSize = maxDim * 0.02;
     const dist = maxDim * 1.6;
     this.camera.position.set(
       center.x + dist,
@@ -232,21 +235,25 @@ class Home3DScene {
     // remove old
     for (const s of this.sprites) this.scene.remove(s.object);
     this.sprites = [];
+    const base = this._baseSize || 1;
     (lights || []).forEach((l) => {
       const color = l.color || defaults.default_glow_color;
-      const size = Number(l.size) || defaults.default_size;
+      // size is a multiplier of the model-relative base size (default 1).
+      const size = Number(l.size) || defaults.default_size || 1;
       const mat = new THREE.SpriteMaterial({
         map: this._glowTex,
         color: new THREE.Color(color),
         transparent: true,
         depthWrite: false,
+        depthTest: false, // always visible (not hidden behind walls/roof)
         blending: THREE.AdditiveBlending,
-        opacity: 0.15,
+        opacity: 0.25,
       });
       const sprite = new THREE.Sprite(mat);
       const p = l.position || [0, 1, 0];
       sprite.position.set(p[0], p[1], p[2]);
-      sprite.scale.setScalar(size * 2);
+      sprite.scale.setScalar(base * size);
+      sprite.renderOrder = 999; // draw on top of the model
       sprite.userData.isLightSprite = true;
       this.scene.add(sprite);
       this.sprites.push({
@@ -261,14 +268,15 @@ class Home3DScene {
 
   /** Update glow per entity state. `getState(entity)` => {on, brightness0to1}. */
   updateStates(getState) {
+    const base = this._baseSize || 1;
     for (const s of this.sprites) {
       const st = s.entity ? getState(s.entity) : { on: false, brightness: 0 };
       const on = !!(st && st.on);
       const b = on ? clamp(st.brightness ?? 1, 0, 1) : 0;
       const mat = s.object.material;
-      mat.opacity = on ? 0.4 + 0.6 * b : 0.15;
-      const pulse = on ? 1 + 0.25 * b : 0.7;
-      s.object.scale.setScalar(s.size * 2 * pulse);
+      mat.opacity = on ? 0.45 + 0.55 * b : 0.25;
+      const pulse = on ? 1 + 0.3 * b : 0.7;
+      s.object.scale.setScalar(base * s.size * pulse);
     }
   }
 
@@ -655,8 +663,8 @@ class Home3DCardEditor extends HTMLElement {
             <input type="color" id="color" value="#ffd27f" />
           </label>
           <label class="f">
-            <span>Size</span>
-            <input type="range" id="size" min="0.1" max="1.5" step="0.05" />
+            <span>Size (×)</span>
+            <input type="range" id="size" min="0.2" max="5" step="0.1" />
           </label>
           <label class="f" style="justify-content:flex-end;">
             <span>&nbsp;</span>

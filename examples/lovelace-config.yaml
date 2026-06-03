@@ -6,26 +6,27 @@ model: /local/home.glb            # your exported GLB in config/www/
 
 # Appearance
 default_glow_color: "#ffd27f"     # warm glow for lights without their own colour
-default_size: 0.35                # marker radius in model units (metres from SH3D)
+default_size: 1                   # marker size multiplier (1 = auto, scaled to model)
 background: "#0d1016"
 ambient_intensity: 0.9
 
 # Starting camera (omit to auto-fit to the model). Use "Save view" in the editor.
-camera:
-  position: [6, 6, 6]
-  target: [0, 1, 0]
+# Values are in the model's own units (centimetres for a Sweet Home 3D export).
+# camera:
+#   position: [600, 500, 600]
+#   target: [0, 100, 0]
 
 # Light markers. Easiest to place these with the visual editor, but you can
-# hand-edit too. position is [x, y, z] in the model's coordinate space.
+# hand-edit too. position is [x, y, z] in the model's coordinate space (cm).
 lights:
   - entity: light.kitchen
-    position: [1.20, 2.40, -0.80]
+    position: [120, 240, -80]
   - entity: light.living_room
-    position: [-2.10, 2.40, 1.50]
+    position: [-210, 240, 150]
     color: "#aee1ff"             # per-light override
-    size: 0.5
+    size: 1.5                    # 1.5× the default marker size
   - entity: light.bedroom
-    position: [3.40, 2.40, 2.10]
+    position: [340, 240, 210]
 
 # If your dashboards are viewed offline, self-host three.js and set:
 # three_cdn: /local/three

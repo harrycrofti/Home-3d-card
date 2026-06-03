@@ -88,14 +88,14 @@ then use **Add light** to place your lights visually. Or write YAML directly:
 type: custom:home-3d-card
 model: /local/home.glb
 default_glow_color: "#ffd27f"
-default_size: 0.35
+default_size: 1            # marker size multiplier (1 = auto, scaled to the model)
 lights:
   - entity: light.kitchen
-    position: [1.20, 2.40, -0.80]   # x, y, z in model units (metres if from SH3D)
+    position: [120, 240, -80]      # x, y, z in the model's own units (cm from SH3D)
   - entity: light.living_room
-    position: [-2.10, 2.40, 1.50]
+    position: [-210, 240, 150]
     color: "#aee1ff"
-    size: 0.5
+    size: 1.5               # 1.5× the default marker size
 camera:
   position: [6, 6, 6]
   target: [0, 1, 0]
@@ -119,7 +119,7 @@ camera:
 | `model` | path | _(none)_ | `/local/…glb` model of your home. **Required.** |
 | `lights` | list | `[]` | Light markers: each `{ entity, position:[x,y,z], color?, size? }`. |
 | `default_glow_color` | colour | `#ffd27f` | Glow colour for lights without their own `color`. |
-| `default_size` | number | `0.35` | Marker radius (world units) for lights without their own `size`. |
+| `default_size` | number | `1` | Marker size multiplier for lights without their own `size`. `1` = auto-sized to the model; the per-light `size` scales relative to that. |
 | `camera` | map | _(auto-fit)_ | `{ position:[x,y,z], target:[x,y,z] }` starting view. |
 | `background` | colour | `#0d1016` | Scene background colour. |
 | `ambient_intensity` | number | `0.9` | Ambient light level for the model. |
