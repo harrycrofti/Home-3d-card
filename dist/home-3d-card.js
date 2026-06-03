@@ -961,14 +961,7 @@ class Home3DCard extends HTMLElement {
 
   _fanAction(act) {
     const cf = this._config.fans[this._popupFan];
-    if (!cf || !this._hass) {
-      console.warn("[home-3d-card] fan action ignored — no fan/hass", {
-        act,
-        popupFan: this._popupFan,
-        hasHass: !!this._hass,
-      });
-      return;
-    }
+    if (!cf || !this._hass) return;
     if (act === "close") {
       this._hideFanPopup();
       return;
@@ -980,28 +973,18 @@ class Home3DCard extends HTMLElement {
       down: ["fan", "decrease_speed", cf.entity],
     };
     const m = map[act];
-    if (!m) return;
-    const [domain, service, entityId] = m;
-    if (!entityId) {
-      console.warn(
-        `[home-3d-card] "${act}" has no entity configured on this fan`,
-        cf
-      );
-      return;
-    }
+    if (!m || !m[2]) return; // unknown action or no entity configured
     try {
-      // eslint-disable-next-line no-console
-      console.debug("[home-3d-card] callService", domain, service, entityId);
-      const ret = this._hass.callService(domain, service, {
-        entity_id: entityId,
-      });
+      const ret = this._hass.callService(m[0], m[1], { entity_id: m[2] });
       if (ret && typeof ret.then === "function") {
         ret.catch((err) =>
-          console.error("[home-3d-card] callService failed", domain, service, err)
+          // eslint-disable-next-line no-console
+          console.error("[home-3d-card] callService failed", m[0], m[1], err)
         );
       }
     } catch (err) {
-      console.error("[home-3d-card] callService threw", domain, service, err);
+      // eslint-disable-next-line no-console
+      console.error("[home-3d-card] callService failed", m[0], m[1], err);
     }
   }
 
