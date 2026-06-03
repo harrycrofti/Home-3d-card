@@ -961,24 +961,47 @@ class Home3DCard extends HTMLElement {
 
   _fanAction(act) {
     const cf = this._config.fans[this._popupFan];
-    if (!cf || !this._hass) return;
-    const h = this._hass;
-    switch (act) {
-      case "close":
-        this._hideFanPopup();
-        return;
-      case "light":
-        if (cf.light) h.callService("light", "toggle", { entity_id: cf.light });
-        return;
-      case "fan":
-        if (cf.entity) h.callService("fan", "toggle", { entity_id: cf.entity });
-        return;
-      case "up":
-        if (cf.entity) h.callService("fan", "increase_speed", { entity_id: cf.entity });
-        return;
-      case "down":
-        if (cf.entity) h.callService("fan", "decrease_speed", { entity_id: cf.entity });
-        return;
+    if (!cf || !this._hass) {
+      console.warn("[home-3d-card] fan action ignored — no fan/hass", {
+        act,
+        popupFan: this._popupFan,
+        hasHass: !!this._hass,
+      });
+      return;
+    }
+    if (act === "close") {
+      this._hideFanPopup();
+      return;
+    }
+    const map = {
+      light: ["light", "toggle", cf.light],
+      fan: ["fan", "toggle", cf.entity],
+      up: ["fan", "increase_speed", cf.entity],
+      down: ["fan", "decrease_speed", cf.entity],
+    };
+    const m = map[act];
+    if (!m) return;
+    const [domain, service, entityId] = m;
+    if (!entityId) {
+      console.warn(
+        `[home-3d-card] "${act}" has no entity configured on this fan`,
+        cf
+      );
+      return;
+    }
+    try {
+      // eslint-disable-next-line no-console
+      console.debug("[home-3d-card] callService", domain, service, entityId);
+      const ret = this._hass.callService(domain, service, {
+        entity_id: entityId,
+      });
+      if (ret && typeof ret.then === "function") {
+        ret.catch((err) =>
+          console.error("[home-3d-card] callService failed", domain, service, err)
+        );
+      }
+    } catch (err) {
+      console.error("[home-3d-card] callService threw", domain, service, err);
     }
   }
 
