@@ -26,6 +26,7 @@ const DEFAULT_CDN = "https://esm.sh";
 let THREE = null;
 let OrbitControls = null;
 let GLTFLoader = null;
+let MeshoptDecoder = null;
 let _threeLoading = null;
 
 async function loadThree(cdn) {
@@ -41,6 +42,11 @@ async function loadThree(cdn) {
     ));
     ({ GLTFLoader } = await import(
       /* @vite-ignore */ `${base}/three@${THREE_VERSION}/examples/jsm/loaders/GLTFLoader.js`
+    ));
+    // Decoder for meshopt-compressed geometry (EXT_meshopt_compression).
+    // Loaded from the same CDN as three so we don't add another host.
+    ({ MeshoptDecoder } = await import(
+      /* @vite-ignore */ `${base}/three@${THREE_VERSION}/examples/jsm/libs/meshopt_decoder.module.js`
     ));
   })();
   return _threeLoading;
@@ -170,6 +176,7 @@ class Home3DScene {
     if (!url) return;
     return new Promise((resolve, reject) => {
       const loader = new GLTFLoader();
+      if (MeshoptDecoder) loader.setMeshoptDecoder(MeshoptDecoder);
       loader.load(
         url,
         (gltf) => {
@@ -321,14 +328,14 @@ class Home3DScene {
         return;
       }
       if (spriteIdx >= 0) {
+        // Clicked a marker → select it (and start a potential drag).
         this._dragIndex = spriteIdx;
         this.controls.enabled = false;
         this.highlight(spriteIdx);
         if (this.onSelect) this.onSelect(spriteIdx);
-      } else {
-        this.highlight(-1);
-        if (this.onSelect) this.onSelect(null);
       }
+      // Clicking empty space keeps the current selection (so the adjust panel
+      // stays open) and lets OrbitControls rotate/pan the view.
     });
 
     el.addEventListener("pointermove", (ev) => {
