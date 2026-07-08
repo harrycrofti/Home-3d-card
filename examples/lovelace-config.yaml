@@ -40,5 +40,33 @@ fans:
 # fan_min_speed: 1.5                 # rad/s at lowest percentage
 # fan_max_speed: 11                  # rad/s at 100%
 
+# Visual polish (all optional; sensible defaults shown)
+# shadows: true            # soft shadows from a fitted directional light
+# exposure: 1.0            # ACES tone-mapping exposure (raise to brighten)
+# match_bulb_color: true   # light glow follows the bulb's real rgb_color when on
+
+# Non-light device markers: switch / cover / climate / sensor / binary_sensor /
+# lock / media_player. Tap = domain action (toggle, or more-info for climate &
+# sensors). Sensor & climate markers show a floating value label. Add them with
+# the editor's "📟 Add device" button, or hand-edit like the lights above:
+devices:
+  - entity: sensor.living_room_temperature
+    position: [0, 240, 0]
+  - entity: switch.porch
+    position: [200, 240, 300]
+  - entity: cover.garage_door
+    position: [-300, 200, 0]
+    label: false             # hide the value label for this marker
+
+# Live energy HUD (panel only, top-left). Wire any of these entity keys; each
+# one present adds a row (Solar / House / Battery / Grid). Omit `energy` for none.
+energy:
+  solar_power: sensor.goodwe_pv_power
+  load_power: sensor.goodwe_house_consumption
+  battery_soc: sensor.goodwe_battery_state_of_charge
+  battery_power: sensor.goodwe_battery_power
+  grid_import: sensor.grid_import_power
+  grid_export: sensor.grid_export_power
+
 # If your dashboards are viewed offline, self-host three.js and set:
 # three_cdn: /local/three

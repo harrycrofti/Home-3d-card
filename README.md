@@ -167,6 +167,11 @@ clicking one part gathers the adjacent parts so the whole fan spins together
 | `light_intensity` | number | `2` | Brightness multiplier for the cast room light. |
 | `light_distance` | number | `0.45` | How far each light reaches, as a fraction of the model's size. |
 | `three_cdn` | url | `https://esm.sh` | Where to load three.js from. Change to self-host for offline dashboards. |
+| `shadows` | bool | `true` | Soft shadows from a fitted directional light. |
+| `exposure` | number | `1.0` | ACES tone-mapping exposure (raise to brighten the whole scene). |
+| `match_bulb_color` | bool | `true` | Light glow (and cast light) follow the bulb's real `rgb_color` when on. |
+| `devices` | list | `[]` | Non-light markers: each `{ entity, position:[x,y,z], color?, size?, label? }`. Domains: `switch`, `cover`, `climate`, `sensor`, `binary_sensor`, `lock`, `media_player`. Tap runs the domain action (toggle, or more-info for climate/sensors); sensor & climate markers show a floating value label (`label: false` to hide). |
+| `energy` | map | _(none)_ | Live HUD panel. Provide any of `solar_power`, `load_power`, `battery_soc`, `battery_power`, `grid_import`, `grid_export` (entity ids); each present key adds a row. Omit for no HUD. |
 
 ---
 
@@ -182,10 +187,15 @@ needs internet access on first load.
 ## Roadmap
 
 - [ ] Optional bundled three.js build (no CDN needed)
-- [ ] Colour-from-bulb glow (match RGB), not just brightness
-- [ ] Per-light icon/label tooltips on hover
-- [ ] Support non-light domains (switches, covers) with custom tap actions
+- [x] Colour-from-bulb glow (match RGB), not just brightness — **v0.2**
+- [x] Hover tooltips (entity name + state) — **v0.2**
+- [x] Non-light domains (switch/cover/climate/sensor/binary_sensor/lock/media_player) with tap actions — **v0.2**
 - [ ] Click-through occlusion (don't toggle a light hidden behind a wall)
+
+### Also new in v0.2
+- Filmic (ACES) tone mapping + image-based lighting + soft shadows for a richer, more three-dimensional render
+- Live **energy HUD** panel (solar / house / battery / grid) via the `energy` option
+- Floating **value labels** for sensor & climate markers
 
 ## License
 

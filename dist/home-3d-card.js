@@ -27,6 +27,7 @@ let THREE = null;
 let OrbitControls = null;
 let GLTFLoader = null;
 let MeshoptDecoder = null;
+let RoomEnvironment = null;
 let _threeLoading = null;
 
 async function loadThree(cdn) {
@@ -47,6 +48,10 @@ async function loadThree(cdn) {
     // Loaded from the same CDN as three so we don't add another host.
     ({ MeshoptDecoder } = await import(
       /* @vite-ignore */ `${base}/three@${THREE_VERSION}/examples/jsm/libs/meshopt_decoder.module.js`
+    ));
+    // Neutral studio environment for image-based lighting (richer materials).
+    ({ RoomEnvironment } = await import(
+      /* @vite-ignore */ `${base}/three@${THREE_VERSION}/examples/jsm/environments/RoomEnvironment.js`
     ));
   })();
   return _threeLoading;
@@ -74,6 +79,26 @@ const DEFAULTS = {
   fan_min_speed: 1.5, // rad/s at lowest non-zero percentage
   fan_max_speed: 11, // rad/s at 100%
   camera: undefined, // { position:[x,y,z], target:[x,y,z] }
+  // (DOMAIN_COLORS below provides per-domain default marker colours)
+  // Visual polish
+  shadows: true, // soft shadows from a fitted directional light
+  exposure: 1.0, // ACES tone-mapping exposure
+  match_bulb_color: true, // glow uses the bulb's real rgb_color when available
+  // Extra device markers (non-light): switch / cover / climate / sensor / binary_sensor
+  devices: [], // [{ entity, position:[x,y,z], color?, size?, label? }]
+  // Optional live energy HUD overlay (panel only)
+  energy: undefined, // { solar_power, load_power, battery_soc, battery_power, grid_import, grid_export }
+};
+
+// Default marker colours per non-light domain (overridable per device).
+const DOMAIN_COLORS = {
+  switch: "#8ad0ff",
+  cover: "#c9a6ff",
+  climate: "#ff9d66",
+  sensor: "#9be7a0",
+  binary_sensor: "#ffe08a",
+  lock: "#ff7a7a",
+  media_player: "#b18cff",
 };
 
 /** Build a soft radial-gradient texture used for the glow sprites. */
@@ -110,6 +135,7 @@ class Home3DScene {
     this.container = container;
     this.interactive = !!opts.interactive; // edit mode = true
     this.sprites = []; // [{ entity, color, size, position:[x,y,z], object }]
+    this.deviceSprites = []; // non-light markers: switch/cover/climate/sensor
     this.fans = []; // [{ entity, node, pivot, origParent, speed, target, reverse }]
     this._glowTex = null;
     this._raf = null;
@@ -120,16 +146,23 @@ class Home3DScene {
 
     // callbacks wired by the host
     this.onTapSprite = null; // (spriteIndex) => void   (view mode)
+    this.onTapDevice = null; // (deviceIndex) => void    (view mode)
     this.onTapFan = null; // (fanIndex) => void          (view mode)
+    this.onHover = null; // (info|null, ev) => void       (view mode)
     this.onPlace = null; // (point Vector3) => void       (edit: add light)
+    this.onPlaceDevice = null; // (point Vector3) => void  (edit: add device)
     this.onPlaceFan = null; // ({name, point}) => void    (edit: add fan)
     this.onSelect = null; // (spriteIndex|null) => void    (edit)
+    this.onSelectDevice = null; // (deviceIndex) => void   (edit)
     this.onSelectFan = null; // (fanIndex) => void         (edit)
-    this.onMove = null; // (spriteIndex, point) => void    (edit: drag)
+    this.onMove = null; // (spriteIndex, point) => void    (edit: drag light)
+    this.onMoveDevice = null; // (deviceIndex, point)=>void (edit: drag device)
 
     this._placing = false;
+    this._placingDevice = false;
     this._placingFan = false;
     this._dragIndex = -1;
+    this._dragKind = "light"; // which array _dragIndex points into
     this._selectedIndex = -1;
   }
 
@@ -157,6 +190,24 @@ class Home3DScene {
     this.renderer.domElement.style.touchAction = "none";
     this.container.appendChild(this.renderer.domElement);
 
+    // Visual polish: filmic tone mapping + sRGB output for lifelike materials.
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = this._cfg.exposure ?? 1.0;
+    this._shadows = this._cfg.shadows !== false;
+    if (this._shadows) {
+      this.renderer.shadowMap.enabled = true;
+      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    }
+    // Image-based lighting from a neutral room environment → nicer reflections
+    // and soft, even fill on PBR materials.
+    try {
+      const pmrem = new THREE.PMREMGenerator(this.renderer);
+      this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    } catch (e) {
+      /* IBL is optional; ignore if unavailable */
+    }
+
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
@@ -169,7 +220,14 @@ class Home3DScene {
     this.scene.add(new THREE.AmbientLight(0xffffff, amb));
     const key = new THREE.DirectionalLight(0xffffff, 0.8);
     key.position.set(5, 10, 7);
+    if (this._shadows) {
+      key.castShadow = true;
+      key.shadow.mapSize.set(2048, 2048);
+      key.shadow.bias = -0.0004;
+      key.shadow.normalBias = 0.02;
+    }
     this.scene.add(key);
+    this._keyLight = key;
     const fill = new THREE.DirectionalLight(0xaecbff, 0.35);
     fill.position.set(-6, 4, -4);
     this.scene.add(fill);
@@ -203,6 +261,14 @@ class Home3DScene {
         (gltf) => {
           if (this._modelRoot) this.scene.remove(this._modelRoot);
           this._modelRoot = gltf.scene;
+          if (this._shadows) {
+            this._modelRoot.traverse((o) => {
+              if (o.isMesh) {
+                o.castShadow = true;
+                o.receiveShadow = true;
+              }
+            });
+          }
           this.scene.add(this._modelRoot);
           this._fitCameraToModel();
           resolve(gltf);
@@ -233,6 +299,32 @@ class Home3DScene {
     this.camera.far = maxDim * 20;
     this.camera.updateProjectionMatrix();
     this.controls.target.copy(center);
+    // Sensible zoom/orbit limits so the model can't be lost or flipped under.
+    this.controls.minDistance = maxDim * 0.15;
+    this.controls.maxDistance = maxDim * 6;
+    this.controls.maxPolarAngle = Math.PI * 0.495; // stay just above the floor
+    // Fit the shadow-casting key light + its frustum to the model.
+    if (this._keyLight) {
+      const k = this._keyLight;
+      k.position.set(
+        center.x + maxDim * 0.6,
+        center.y + maxDim * 1.4,
+        center.z + maxDim * 0.5
+      );
+      k.target.position.copy(center);
+      this.scene.add(k.target);
+      if (this._shadows && k.shadow) {
+        const d = maxDim * 0.75;
+        const sc = k.shadow.camera;
+        sc.left = -d;
+        sc.right = d;
+        sc.top = d;
+        sc.bottom = -d;
+        sc.near = maxDim * 0.05;
+        sc.far = maxDim * 4;
+        sc.updateProjectionMatrix();
+      }
+    }
     this.controls.update();
   }
 
@@ -313,11 +405,20 @@ class Home3DScene {
   /** Update glow per entity state. `getState(entity)` => {on, brightness0to1}. */
   updateStates(getState) {
     const base = this._baseSize || 1;
+    const matchColor = !this._cfg || this._cfg.match_bulb_color !== false;
     for (const s of this.sprites) {
       const st = s.entity ? getState(s.entity) : { on: false, brightness: 0 };
       const on = !!(st && st.on);
       const b = on ? clamp(st.brightness ?? 1, 0, 1) : 0;
       const mat = s.object.material;
+      // View mode: glow (and cast light) adopt the bulb's real rgb when known,
+      // else the configured colour. Skip in edit mode so the white selection
+      // highlight isn't clobbered.
+      if (!this.interactive) {
+        const col = on && matchColor && st.rgb ? st.rgb : s.color;
+        mat.color.set(col);
+        if (s.light) s.light.color.set(col);
+      }
       mat.opacity = on ? 0.45 + 0.55 * b : 0.25;
       const pulse = on ? 1 + 0.3 * b : 0.7;
       s.object.scale.setScalar(base * s.size * pulse);
@@ -331,6 +432,142 @@ class Home3DScene {
     this.sprites.forEach((s, i) => {
       s.object.material.color.set(i === index ? "#ffffff" : s.color);
     });
+  }
+
+  /* ---- devices (non-light markers: switch/cover/climate/sensor/…) ---- */
+
+  /** Rebuild device markers from a devices config array. */
+  setDevices(devices, cfg) {
+    for (const d of this.deviceSprites) {
+      this.scene.remove(d.object);
+      if (d.labelEl && d.labelEl.parentNode) d.labelEl.parentNode.removeChild(d.labelEl);
+    }
+    this.deviceSprites = [];
+    const base = this._baseSize || 1;
+    const defColor = (cfg && cfg.default_glow_color) || DEFAULTS.default_glow_color;
+    const defSize = (cfg && cfg.default_size) || 1;
+    (devices || []).forEach((d) => {
+      const domain = (d.entity || "").split(".")[0];
+      const color = d.color || DOMAIN_COLORS[domain] || defColor;
+      const size = Number(d.size) || defSize;
+      const mat = new THREE.SpriteMaterial({
+        map: this._glowTex,
+        color: new THREE.Color(color),
+        transparent: true,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+        opacity: 0.3,
+      });
+      const sprite = new THREE.Sprite(mat);
+      const p = d.position || [0, 1, 0];
+      sprite.position.set(p[0], p[1], p[2]);
+      sprite.scale.setScalar(base * size);
+      sprite.renderOrder = 999;
+      sprite.userData.isDeviceSprite = true;
+      this.scene.add(sprite);
+      // Floating value label (unless disabled) — anchored to the marker and
+      // projected to screen each frame in _updateLabels().
+      let labelEl = null;
+      if (d.label !== false && this.container) {
+        labelEl = document.createElement("div");
+        labelEl.className = "h3d-label";
+        labelEl.style.cssText =
+          "position:absolute;transform:translate(-50%,-150%);pointer-events:none;" +
+          "padding:2px 7px;border-radius:9px;font:600 11px/1.25 system-ui,Roboto,sans-serif;" +
+          "color:#fff;background:rgba(16,20,28,0.72);border:1px solid rgba(255,255,255,0.16);" +
+          "white-space:nowrap;z-index:5;display:none;box-shadow:0 2px 8px rgba(0,0,0,0.4);";
+        this.container.appendChild(labelEl);
+      }
+      this.deviceSprites.push({
+        entity: d.entity,
+        domain,
+        color,
+        size,
+        position: [p[0], p[1], p[2]],
+        object: sprite,
+        labelEl,
+      });
+    });
+  }
+
+  /** getDev(entity) => { active, brightness?, text?, rgb? }. */
+  updateDeviceStates(getDev) {
+    const base = this._baseSize || 1;
+    for (const d of this.deviceSprites) {
+      const st = d.entity ? getDev(d.entity) : null;
+      const active = !!(st && st.active);
+      const b = active ? clamp(st.brightness ?? 1, 0, 1) : 0;
+      const passive = d.domain === "sensor" || d.domain === "binary_sensor";
+      const mat = d.object.material;
+      if (!this.interactive) {
+        mat.color.set(active && st && st.rgb ? st.rgb : d.color);
+      }
+      mat.opacity = active ? 0.5 + 0.5 * b : passive ? 0.32 : 0.16;
+      const pulse = active ? 1 + 0.25 * b : 0.75;
+      d.object.scale.setScalar(base * d.size * pulse);
+      if (d.labelEl) {
+        const text = st && st.text != null ? String(st.text) : "";
+        d.labelEl.textContent = text;
+        d.labelEl.dataset.has = text ? "1" : "";
+      }
+    }
+  }
+
+  highlightDevice(index) {
+    this.deviceSprites.forEach((d, i) => {
+      d.object.material.color.set(i === index ? "#ffffff" : d.color);
+    });
+  }
+
+  /** Project device labels to 2D and position them over the canvas. */
+  _updateLabels() {
+    if (!this.deviceSprites.length || !this.renderer || !this.camera) return;
+    const w = this.container.clientWidth || 1;
+    const h = this.container.clientHeight || 1;
+    const v = new THREE.Vector3();
+    for (const d of this.deviceSprites) {
+      const el = d.labelEl;
+      if (!el) continue;
+      if (!el.dataset.has) {
+        el.style.display = "none";
+        continue;
+      }
+      v.set(d.position[0], d.position[1], d.position[2]).project(this.camera);
+      if (v.z > 1) {
+        el.style.display = "none";
+        continue;
+      }
+      el.style.left = (v.x * 0.5 + 0.5) * w + "px";
+      el.style.top = (-v.y * 0.5 + 0.5) * h + "px";
+      el.style.display = "block";
+    }
+  }
+
+  _raycastDevices() {
+    this._raycaster.setFromCamera(this._pointer, this.camera);
+    const objs = this.deviceSprites.map((s) => s.object);
+    const hits = this._raycaster.intersectObjects(objs, false);
+    if (!hits.length) return -1;
+    return objs.indexOf(hits[0].object);
+  }
+
+  /** What entity (if any) is under the pointer — for view-mode hover. */
+  _hoverInfo() {
+    const si = this._raycastSprites();
+    if (si >= 0) return { entity: this.sprites[si].entity, kind: "light" };
+    const di = this._raycastDevices();
+    if (di >= 0) {
+      const d = this.deviceSprites[di];
+      return { entity: d.entity, kind: "device", domain: d.domain };
+    }
+    const hit = this._raycastModelHit();
+    if (hit) {
+      const fi = this._fanIndexForObject(hit.object);
+      if (fi >= 0)
+        return { entity: this.fans[fi].entity, light: this.fans[fi].light, kind: "fan" };
+    }
+    return null;
   }
 
   /* ---- fans ---- */
@@ -537,6 +774,11 @@ class Home3DScene {
     this.renderer.domElement.style.cursor = on ? "crosshair" : "";
   }
 
+  setPlacingDevice(on) {
+    this._placingDevice = on;
+    this.renderer.domElement.style.cursor = on ? "crosshair" : "";
+  }
+
   _ndc(ev) {
     const r = this.renderer.domElement.getBoundingClientRect();
     this._pointer.x = ((ev.clientX - r.left) / r.width) * 2 - 1;
@@ -577,9 +819,14 @@ class Home3DScene {
       const spriteIdx = this._raycastSprites();
 
       if (!this.interactive) {
-        // VIEW mode: tap a light → toggle; else maybe a fan → toggle
+        // VIEW mode: tap a light → toggle; a device → its action; a fan → popup.
         if (spriteIdx >= 0 && this.onTapSprite) {
           this.onTapSprite(spriteIdx);
+          return;
+        }
+        const devIdx = this._raycastDevices();
+        if (devIdx >= 0 && this.onTapDevice) {
+          this.onTapDevice(devIdx);
           return;
         }
         const hit = this._raycastModelHit();
@@ -591,6 +838,12 @@ class Home3DScene {
       }
 
       // EDIT mode
+      if (this._placingDevice) {
+        const pt = this._raycastModel();
+        if (pt && this.onPlaceDevice) this.onPlaceDevice(pt);
+        this.setPlacingDevice(false);
+        return;
+      }
       if (this._placingFan) {
         const hit = this._raycastModelHit();
         if (hit && this.onPlaceFan) {
@@ -611,28 +864,52 @@ class Home3DScene {
         return;
       }
       if (spriteIdx >= 0) {
-        // Clicked a marker → select it (and start a potential drag).
+        // Clicked a light marker → select it (and start a potential drag).
         this._dragIndex = spriteIdx;
+        this._dragKind = "light";
         this.controls.enabled = false;
         this.highlight(spriteIdx);
         if (this.onSelect) this.onSelect(spriteIdx);
       } else {
-        // Clicked a model object that's a registered fan → select it.
-        const hit = this._raycastModelHit();
-        if (hit) {
-          const fi = this._fanIndexForObject(hit.object);
-          if (fi >= 0 && this.onSelectFan) this.onSelectFan(fi);
+        const devIdx = this._raycastDevices();
+        if (devIdx >= 0) {
+          // Clicked a device marker → select + potential drag.
+          this._dragIndex = devIdx;
+          this._dragKind = "device";
+          this.controls.enabled = false;
+          this.highlightDevice(devIdx);
+          if (this.onSelectDevice) this.onSelectDevice(devIdx);
+        } else {
+          // Clicked a model object that's a registered fan → select it.
+          const hit = this._raycastModelHit();
+          if (hit) {
+            const fi = this._fanIndexForObject(hit.object);
+            if (fi >= 0 && this.onSelectFan) this.onSelectFan(fi);
+          }
         }
       }
       // Otherwise selection is kept and OrbitControls rotates/pans the view.
     });
 
     el.addEventListener("pointermove", (ev) => {
+      // VIEW mode: report what's under the cursor for hover tooltips.
+      if (!this.interactive && this.onHover) {
+        this._ndc(ev);
+        this.onHover(this._hoverInfo(), ev);
+      }
       if (this._dragIndex < 0) return;
       this._ndc(ev);
       const pt = this._raycastModel();
-      if (pt) {
+      if (!pt) return;
+      if (this._dragKind === "device") {
+        const d = this.deviceSprites[this._dragIndex];
+        if (!d) return;
+        d.object.position.copy(pt);
+        d.position = [round(pt.x), round(pt.y), round(pt.z)];
+        if (this.onMoveDevice) this.onMoveDevice(this._dragIndex, d.position);
+      } else {
         const s = this.sprites[this._dragIndex];
+        if (!s) return;
         s.object.position.copy(pt);
         s.position = [round(pt.x), round(pt.y), round(pt.z)];
         if (this.onMove) this.onMove(this._dragIndex, s.position);
@@ -665,12 +942,16 @@ class Home3DScene {
     }
     if (this.controls) this.controls.update();
     if (this.renderer) this.renderer.render(this.scene, this.camera);
+    this._updateLabels();
   }
 
   dispose() {
     this._disposed = true;
     if (this._raf) cancelAnimationFrame(this._raf);
     if (this._resizeObserver) this._resizeObserver.disconnect();
+    for (const d of this.deviceSprites || []) {
+      if (d.labelEl && d.labelEl.parentNode) d.labelEl.parentNode.removeChild(d.labelEl);
+    }
     if (this.renderer) {
       this.renderer.dispose();
       const el = this.renderer.domElement;
@@ -716,15 +997,18 @@ class Home3DCard extends HTMLElement {
     const incoming = { ...DEFAULTS, ...config };
     if (!incoming.lights) incoming.lights = [];
     if (!incoming.fans) incoming.fans = [];
+    if (!incoming.devices) incoming.devices = [];
     const modelChanged =
       !this._scene || incoming.model !== (this._config && this._config.model);
     this._config = incoming;
     if (modelChanged) {
       this._build(); // first build, or model path changed → (re)load scene
     } else if (this._ready) {
-      // Only lights/fans/appearance changed → refresh without reloading.
+      // Only lights/devices/fans/appearance changed → refresh without reloading.
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setDevices(this._config.devices, this._config);
       this._scene.setFans(this._config.fans, this._config);
+      this._buildEnergyHud();
       this._applyStates();
     }
   }
@@ -742,8 +1026,13 @@ class Home3DCard extends HTMLElement {
     const st = this._hass && this._hass.states[entity];
     if (!st) return { on: false, brightness: 0 };
     const on = st.state === "on";
-    const b = st.attributes && st.attributes.brightness;
-    return { on, brightness: b != null ? b / 255 : 1 };
+    const a = st.attributes || {};
+    const b = a.brightness;
+    let rgb = null;
+    if (Array.isArray(a.rgb_color) && a.rgb_color.length === 3) {
+      rgb = `rgb(${a.rgb_color[0]},${a.rgb_color[1]},${a.rgb_color[2]})`;
+    }
+    return { on, brightness: b != null ? b / 255 : 1, rgb };
   }
 
   _fanStateFor(entity) {
@@ -757,12 +1046,200 @@ class Home3DCard extends HTMLElement {
   _applyStates() {
     if (this._scene && this._ready) {
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateDeviceStates((e) => this._deviceStateFor(e));
       this._scene.updateFanStates(
         (e) => this._fanStateFor(e),
         (e) => this._stateFor(e)
       );
     }
+    this._updateEnergyHud();
     if (this._popupFan != null) this._refreshFanPopup();
+  }
+
+  /* ---- devices (non-light markers) ---- */
+
+  /** Resolve a device entity to { active, brightness?, text?, rgb? }. */
+  _deviceStateFor(entity) {
+    const st = this._hass && this._hass.states[entity];
+    if (!st) return { active: false, text: "" };
+    const domain = entity.split(".")[0];
+    const a = st.attributes || {};
+    const s = st.state;
+    let active = false;
+    let brightness = 1;
+    let rgb = null;
+    let text = "";
+    if (domain === "light") {
+      active = s === "on";
+      if (a.brightness != null) brightness = a.brightness / 255;
+      if (Array.isArray(a.rgb_color) && a.rgb_color.length === 3)
+        rgb = `rgb(${a.rgb_color[0]},${a.rgb_color[1]},${a.rgb_color[2]})`;
+    } else if (domain === "switch" || domain === "input_boolean" || domain === "fan") {
+      active = s === "on";
+    } else if (domain === "cover") {
+      active = s === "open";
+      text = s;
+    } else if (domain === "lock") {
+      active = s === "unlocked";
+      text = s;
+    } else if (domain === "climate") {
+      active = s !== "off" && s !== "unavailable" && s !== "unknown";
+      const cur = a.current_temperature;
+      const tgt = a.temperature;
+      const unit =
+        (this._hass.config &&
+          this._hass.config.unit_system &&
+          this._hass.config.unit_system.temperature) ||
+        "°";
+      text =
+        (cur != null ? `${cur}${unit}` : s) +
+        (tgt != null ? ` → ${tgt}${unit}` : "");
+    } else if (domain === "sensor") {
+      const u = a.unit_of_measurement || "";
+      text = s === "unknown" || s === "unavailable" ? s : `${s}${u ? " " + u : ""}`;
+    } else if (domain === "binary_sensor") {
+      active = s === "on";
+      text = s === "on" ? a.device_class || "on" : "off";
+    } else {
+      active = s === "on";
+      text = s;
+    }
+    return { active, brightness, rgb, text };
+  }
+
+  /** Domain-appropriate tap action for a device marker. */
+  _deviceAction(i) {
+    const cf = this._config.devices[i];
+    if (!cf || !cf.entity || !this._hass) return;
+    const domain = cf.entity.split(".")[0];
+    const svc = {
+      light: ["light", "toggle"],
+      switch: ["switch", "toggle"],
+      input_boolean: ["input_boolean", "toggle"],
+      fan: ["fan", "toggle"],
+      cover: ["cover", "toggle"],
+      lock: ["lock", "toggle"],
+      media_player: ["media_player", "media_play_pause"],
+    }[domain];
+    if (svc) {
+      const ret = this._hass.callService(svc[0], svc[1], { entity_id: cf.entity });
+      if (ret && typeof ret.then === "function") {
+        // eslint-disable-next-line no-console
+        ret.catch((err) => console.error("[home-3d-card] device action failed", err));
+      }
+    } else {
+      // climate / sensor / binary_sensor / anything else → open more-info.
+      this._openMoreInfo(cf.entity);
+    }
+  }
+
+  _openMoreInfo(entity) {
+    this.dispatchEvent(
+      new CustomEvent("hass-more-info", {
+        detail: { entityId: entity },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+
+  /* ---- hover tooltip ---- */
+
+  _showTip(info, ev) {
+    const tip = this.shadowRoot.getElementById("tip");
+    if (!tip) return;
+    const canvas = this._scene && this._scene.renderer && this._scene.renderer.domElement;
+    if (!info || !info.entity || !this._hass) {
+      tip.classList.remove("show");
+      if (canvas) canvas.style.cursor = "";
+      return;
+    }
+    const st = this._hass.states[info.entity];
+    const name = (st && st.attributes && st.attributes.friendly_name) || info.entity;
+    let sv = st ? st.state : "";
+    const u = st && st.attributes && st.attributes.unit_of_measurement;
+    if (u) sv += " " + u;
+    tip.innerHTML = `<b>${name}</b>${sv ? ` · ${sv}` : ""}`;
+    const wrap = this.shadowRoot.querySelector(".wrap");
+    const r = wrap.getBoundingClientRect();
+    tip.style.left = ev.clientX - r.left + "px";
+    tip.style.top = ev.clientY - r.top + "px";
+    tip.classList.add("show");
+    if (canvas) canvas.style.cursor = "pointer";
+  }
+
+  /* ---- energy HUD (panel only) ---- */
+
+  _energyRows() {
+    const e = this._config && this._config.energy;
+    if (!e || typeof e !== "object") return [];
+    const rows = [];
+    if (e.solar_power) rows.push({ key: "solar", ic: "☀️", lb: "Solar" });
+    if (e.load_power) rows.push({ key: "load", ic: "🏠", lb: "House" });
+    if (e.battery_soc || e.battery_power) rows.push({ key: "batt", ic: "🔋", lb: "Battery" });
+    if (e.grid_import || e.grid_export) rows.push({ key: "grid", ic: "⚡", lb: "Grid" });
+    return rows;
+  }
+
+  _buildEnergyHud() {
+    const hud = this.shadowRoot && this.shadowRoot.getElementById("hud");
+    if (!hud) return;
+    const rows = this._energyRows();
+    if (!rows.length) {
+      hud.classList.remove("show");
+      hud.innerHTML = "";
+      return;
+    }
+    hud.innerHTML = rows
+      .map(
+        (r) =>
+          `<div class="er"><span class="ic">${r.ic}</span>` +
+          `<span class="lb">${r.lb}</span>` +
+          `<span class="vl" id="ev-${r.key}">—</span></div>`
+      )
+      .join("");
+    hud.classList.add("show");
+  }
+
+  _updateEnergyHud() {
+    const hud = this.shadowRoot && this.shadowRoot.getElementById("hud");
+    if (!hud || !hud.classList.contains("show") || !this._hass) return;
+    const e = this._config.energy || {};
+    const num = (ent) => {
+      const st = ent && this._hass.states[ent];
+      return st ? parseFloat(st.state) : NaN;
+    };
+    const fmt = (ent) => {
+      const st = ent && this._hass.states[ent];
+      if (!st) return "—";
+      const v = parseFloat(st.state);
+      const u = (st.attributes && st.attributes.unit_of_measurement) || "";
+      if (isNaN(v)) return st.state;
+      return `${Math.abs(v) >= 100 ? Math.round(v) : v.toFixed(2)}${u ? " " + u : ""}`;
+    };
+    const set = (k, txt) => {
+      const el = hud.querySelector(`#ev-${k}`);
+      if (el) el.textContent = txt;
+    };
+    if (e.solar_power) set("solar", fmt(e.solar_power));
+    if (e.load_power) set("load", fmt(e.load_power));
+    if (e.battery_soc || e.battery_power) {
+      let t = "";
+      const soc = num(e.battery_soc);
+      if (!isNaN(soc)) t += `${Math.round(soc)}%`;
+      const p = num(e.battery_power);
+      if (!isNaN(p) && Math.abs(p) > 0.01)
+        t += `${t ? " · " : ""}${p > 0 ? "▼" : "▲"}${Math.abs(p).toFixed(2)}`;
+      set("batt", t || "—");
+    }
+    if (e.grid_import || e.grid_export) {
+      const imp = num(e.grid_import);
+      const exp = num(e.grid_export);
+      let t = "idle";
+      if (!isNaN(exp) && exp > 0.02) t = `▲ ${exp.toFixed(2)} exp`;
+      else if (!isNaN(imp) && imp > 0.02) t = `▼ ${imp.toFixed(2)} imp`;
+      set("grid", t);
+    }
   }
 
   async _build() {
@@ -801,10 +1278,33 @@ class Home3DCard extends HTMLElement {
         .popup button.spdbtn { flex:0 0 60px; min-height:48px; font-size:1.4rem; border-radius:10px; }
         .popup button.pclose { width:36px; height:36px; flex:none; border-radius:9px; font-size:1rem; }
         .popup .spd { flex:1; text-align:center; font-weight:700; font-size:1rem; }
+        .hud {
+          position:absolute; top:10px; left:10px; z-index:6; display:none;
+          flex-direction:column; gap:4px; padding:8px 11px; color:#fff;
+          background:rgba(16,20,28,0.66); border:1px solid rgba(255,255,255,0.14);
+          border-radius:12px; box-shadow:0 6px 20px rgba(0,0,0,0.42);
+          -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+          font:600 12px/1.3 system-ui,Roboto,sans-serif; pointer-events:none;
+        }
+        .hud.show { display:flex; }
+        .hud .er { display:flex; align-items:center; gap:8px; white-space:nowrap; min-width:150px; }
+        .hud .er .ic { width:16px; text-align:center; }
+        .hud .er .lb { color:rgba(255,255,255,0.72); font-weight:500; }
+        .hud .er .vl { margin-left:auto; font-variant-numeric:tabular-nums; }
+        .tip {
+          position:absolute; z-index:7; display:none; pointer-events:none;
+          transform:translate(12px,-50%); padding:3px 8px; border-radius:8px;
+          background:rgba(16,20,28,0.92); color:#fff; white-space:nowrap;
+          border:1px solid rgba(255,255,255,0.16); box-shadow:0 4px 14px rgba(0,0,0,0.5);
+          font:500 12px system-ui,Roboto,sans-serif;
+        }
+        .tip.show { display:block; }
       </style>
       <ha-card>
         <div class="wrap">
           <div class="stage" id="stage"></div>
+          <div class="hud" id="hud"></div>
+          <div class="tip" id="tip"></div>
           <div class="msg" id="msg">Loading 3D model…</div>
           <div class="pop-back" id="pop-back"></div>
           <div class="popup" id="popup"></div>
@@ -837,7 +1337,11 @@ class Home3DCard extends HTMLElement {
         this._hass.callService("light", "toggle", { entity_id: s.entity });
       }
     };
+    this._scene.onTapDevice = (i) => this._deviceAction(i);
     this._scene.onTapFan = (i) => this._showFanPopup(i);
+    this._scene.onHover = (info, ev) => this._showTip(info, ev);
+
+    this._buildEnergyHud();
 
     try {
       await this._scene.init(
@@ -848,6 +1352,7 @@ class Home3DCard extends HTMLElement {
       await this._scene.loadModel(this._config.model);
       if (this._config.camera) this._scene.applyCamera(this._config.camera);
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setDevices(this._config.devices, this._config);
       this._scene.setFans(this._config.fans, this._config);
       this._ready = true;
       msg.style.display = "none";
@@ -1008,6 +1513,7 @@ class Home3DCardEditor extends HTMLElement {
     this._scene = null;
     this._ready = false;
     this._selected = -1;
+    this._selectedDevice = -1;
     this._selectedFan = -1;
     this._built = false;
   }
@@ -1036,10 +1542,12 @@ class Home3DCardEditor extends HTMLElement {
     if (!this._built || modelChanged) {
       this._build(); // first build, or model path changed → (re)load scene
     } else if (this._scene && this._ready) {
-      // Only lights/fans/appearance changed externally → refresh in place.
+      // Only lights/devices/fans/appearance changed externally → refresh in place.
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setDevices(this._config.devices, this._config);
       this._scene.setFans(this._config.fans, this._config);
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateDeviceStates((e) => this._deviceStateFor(e));
       this._scene.updateFanStates(
         (e) => this._fanStateFor(e),
         (e) => this._stateFor(e)
@@ -1050,9 +1558,11 @@ class Home3DCardEditor extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     this._fillEntityPicker();
+    this._fillDevicePicker();
     this._fillFanPicker();
     if (this._scene && this._ready) {
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateDeviceStates((e) => this._deviceStateFor(e));
       this._scene.updateFanStates(
         (e) => this._fanStateFor(e),
         (e) => this._stateFor(e)
@@ -1140,6 +1650,153 @@ class Home3DCardEditor extends HTMLElement {
     }
   }
 
+  /* ---- device picking / panel (edit mode) ---- */
+
+  _deviceEntities() {
+    if (!this._hass) return [];
+    const doms = [
+      "switch",
+      "cover",
+      "climate",
+      "sensor",
+      "binary_sensor",
+      "lock",
+      "media_player",
+      "input_boolean",
+    ];
+    return Object.keys(this._hass.states)
+      .filter((e) => doms.indexOf(e.split(".")[0]) >= 0)
+      .sort();
+  }
+
+  _fillDevicePicker() {
+    const sel = this.shadowRoot.getElementById("dev-pick");
+    if (!sel || sel.childElementCount || !this._hass) return;
+    sel.innerHTML =
+      `<option value="">— pick a device entity —</option>` +
+      this._deviceEntities()
+        .map((e) => {
+          const fn = (this._hass.states[e].attributes || {}).friendly_name || e;
+          return `<option value="${e}">${fn} (${e})</option>`;
+        })
+        .join("");
+  }
+
+  /** Compact device resolver for the editor preview. */
+  _deviceStateFor(entity) {
+    const st = this._hass && this._hass.states[entity];
+    if (!st) return { active: false, text: "" };
+    const domain = entity.split(".")[0];
+    const a = st.attributes || {};
+    const s = st.state;
+    let active = false;
+    let text = "";
+    if (domain === "cover") {
+      active = s === "open";
+      text = s;
+    } else if (domain === "lock") {
+      active = s === "unlocked";
+      text = s;
+    } else if (domain === "climate") {
+      active = s !== "off" && s !== "unavailable";
+      text = a.current_temperature != null ? `${a.current_temperature}°` : s;
+    } else if (domain === "sensor") {
+      const u = a.unit_of_measurement || "";
+      text = `${s}${u ? " " + u : ""}`;
+    } else if (domain === "binary_sensor") {
+      active = s === "on";
+      text = s;
+    } else {
+      active = s === "on";
+    }
+    return { active, text };
+  }
+
+  _addDeviceAt(pt) {
+    const dev = {
+      entity: "",
+      position: [round(pt.x), round(pt.y), round(pt.z)],
+      color: "#8ad0ff",
+      size: this._config.default_size,
+    };
+    this._config.devices.push(dev);
+    this._emit();
+    this._scene.setDevices(this._config.devices, this._config);
+    this._scene.updateDeviceStates((e) => this._deviceStateFor(e));
+    this._selectDevice(this._config.devices.length - 1);
+    this._scene.highlightDevice(this._selectedDevice);
+    this.shadowRoot.getElementById("placehint").textContent = "";
+  }
+
+  _selectDevice(i) {
+    this._selectedDevice = i == null ? -1 : i;
+    this.shadowRoot.getElementById("sel").hidden = true;
+    this.shadowRoot.getElementById("fansel").hidden = true;
+    this._selected = -1;
+    this._selectedFan = -1;
+    const panel = this.shadowRoot.getElementById("devsel");
+    if (this._selectedDevice < 0) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    const d = this._config.devices[this._selectedDevice];
+    this.shadowRoot.getElementById("dev-pick").value = d.entity || "";
+    this.shadowRoot.getElementById("dev-color").value = d.color || "#8ad0ff";
+    this.shadowRoot.getElementById("dev-size").value =
+      d.size || this._config.default_size;
+    this.shadowRoot.getElementById("dev-label").checked = d.label !== false;
+  }
+
+  _wireDevicePanel() {
+    const root = this.shadowRoot;
+    const refresh = () => {
+      this._scene.setDevices(this._config.devices, this._config);
+      this._scene.updateDeviceStates((e) => this._deviceStateFor(e));
+      if (this._selectedDevice >= 0) this._scene.highlightDevice(this._selectedDevice);
+    };
+    root.getElementById("dev-pick").addEventListener("change", (e) => {
+      if (this._selectedDevice < 0) return;
+      const dev = this._config.devices[this._selectedDevice];
+      dev.entity = e.target.value;
+      // Adopt the domain's default colour when picking an entity.
+      const dom = (e.target.value || "").split(".")[0];
+      if (DOMAIN_COLORS[dom]) {
+        dev.color = DOMAIN_COLORS[dom];
+        root.getElementById("dev-color").value = DOMAIN_COLORS[dom];
+      }
+      this._emit();
+      refresh();
+    });
+    root.getElementById("dev-color").addEventListener("change", (e) => {
+      if (this._selectedDevice < 0) return;
+      this._config.devices[this._selectedDevice].color = e.target.value;
+      this._emit();
+      refresh();
+    });
+    root.getElementById("dev-size").addEventListener("input", (e) => {
+      if (this._selectedDevice < 0) return;
+      this._config.devices[this._selectedDevice].size = parseFloat(e.target.value);
+      this._emit();
+      refresh();
+    });
+    root.getElementById("dev-label").addEventListener("change", (e) => {
+      if (this._selectedDevice < 0) return;
+      this._config.devices[this._selectedDevice].label = e.target.checked
+        ? undefined
+        : false;
+      this._emit();
+      refresh();
+    });
+    root.getElementById("dev-del").addEventListener("click", () => {
+      if (this._selectedDevice < 0) return;
+      this._config.devices.splice(this._selectedDevice, 1);
+      this._emit();
+      this._selectDevice(null);
+      refresh();
+    });
+  }
+
   async _build() {
     const root = this.shadowRoot;
     root.innerHTML = `
@@ -1181,11 +1838,12 @@ class Home3DCardEditor extends HTMLElement {
 
       <div class="toolbar">
         <button id="add">➕ Add light</button>
+        <button id="adddev">📟 Add device</button>
         <button id="addfan">🌀 Add fan</button>
         <button id="savecam">📷 Save view</button>
         <span class="hint" id="placehint"></span>
       </div>
-      <div class="hint"><b>Add light</b> → click a spot on the model. <b>Add fan</b> → click the fan object. Click a marker/fan to select it; drag a marker to reposition.</div>
+      <div class="hint"><b>Add light/device</b> → click a spot on the model. <b>Add fan</b> → click the fan object. Click a marker/fan to select it; drag a marker to reposition. Devices support switch, cover, climate, sensor, binary_sensor, lock &amp; media_player.</div>
 
       <div class="sel" id="sel" hidden>
         <div class="grid2">
@@ -1204,6 +1862,31 @@ class Home3DCardEditor extends HTMLElement {
           <label class="f" style="justify-content:flex-end;">
             <span>&nbsp;</span>
             <button id="del">🗑 Delete light</button>
+          </label>
+        </div>
+      </div>
+
+      <div class="sel" id="devsel" hidden>
+        <div class="grid2">
+          <label class="f">
+            <span>Device entity</span>
+            <select id="dev-pick"></select>
+          </label>
+          <label class="f">
+            <span>Marker colour</span>
+            <input type="color" id="dev-color" value="#8ad0ff" />
+          </label>
+          <label class="f">
+            <span>Size (×)</span>
+            <input type="range" id="dev-size" min="0.2" max="5" step="0.1" />
+          </label>
+          <label class="f" style="flex-direction:row; align-items:center; gap:8px;">
+            <input type="checkbox" id="dev-label" checked />
+            <span>Show value label</span>
+          </label>
+          <label class="f" style="justify-content:flex-end;">
+            <span>&nbsp;</span>
+            <button id="dev-del">🗑 Remove device</button>
           </label>
         </div>
       </div>
@@ -1248,6 +1931,13 @@ class Home3DCardEditor extends HTMLElement {
           "Now click a spot on the model…";
       }
     });
+    root.getElementById("adddev").addEventListener("click", () => {
+      if (this._scene) {
+        this._scene.setPlacingDevice(true);
+        root.getElementById("placehint").textContent =
+          "Now click a spot on the model for the device…";
+      }
+    });
     root.getElementById("addfan").addEventListener("click", () => {
       if (this._scene) {
         this._scene.setPlacingFan(true);
@@ -1263,8 +1953,10 @@ class Home3DCardEditor extends HTMLElement {
     });
 
     this._wireSelectionPanel();
+    this._wireDevicePanel();
     this._wireFanPanel();
     this._fillEntityPicker();
+    this._fillDevicePicker();
     this._fillFanPicker();
 
     // build scene
@@ -1280,11 +1972,17 @@ class Home3DCardEditor extends HTMLElement {
 
     this._scene = new Home3DScene(stage, { interactive: true });
     this._scene.onPlace = (pt) => this._addLightAt(pt);
+    this._scene.onPlaceDevice = (pt) => this._addDeviceAt(pt);
     this._scene.onPlaceFan = (hit) => this._addFanAt(hit);
     this._scene.onSelect = (i) => this._selectLight(i);
+    this._scene.onSelectDevice = (i) => this._selectDevice(i);
     this._scene.onSelectFan = (i) => this._selectFan(i);
     this._scene.onMove = (i, pos) => {
       this._config.lights[i].position = pos;
+      this._emit();
+    };
+    this._scene.onMoveDevice = (i, pos) => {
+      this._config.devices[i].position = pos;
       this._emit();
     };
 
@@ -1297,10 +1995,12 @@ class Home3DCardEditor extends HTMLElement {
       await this._scene.loadModel(this._config.model);
       if (this._config.camera) this._scene.applyCamera(this._config.camera);
       this._scene.setSprites(this._config.lights, this._config);
+      this._scene.setDevices(this._config.devices, this._config);
       this._scene.setFans(this._config.fans, this._config);
       this._ready = true;
       msg.style.display = "none";
       this._scene.updateStates((e) => this._stateFor(e));
+      this._scene.updateDeviceStates((e) => this._deviceStateFor(e));
       this._scene.updateFanStates(
         (e) => this._fanStateFor(e),
         (e) => this._stateFor(e)
@@ -1330,7 +2030,9 @@ class Home3DCardEditor extends HTMLElement {
   _selectLight(i) {
     this._selected = i == null ? -1 : i;
     this.shadowRoot.getElementById("fansel").hidden = true; // hide fan panel
+    this.shadowRoot.getElementById("devsel").hidden = true; // hide device panel
     this._selectedFan = -1;
+    this._selectedDevice = -1;
     const panel = this.shadowRoot.getElementById("sel");
     if (this._selected < 0) {
       panel.hidden = true;
@@ -1366,7 +2068,9 @@ class Home3DCardEditor extends HTMLElement {
   _selectFan(i) {
     this._selectedFan = i == null ? -1 : i;
     this.shadowRoot.getElementById("sel").hidden = true; // hide light panel
+    this.shadowRoot.getElementById("devsel").hidden = true; // hide device panel
     this._selected = -1;
+    this._selectedDevice = -1;
     const panel = this.shadowRoot.getElementById("fansel");
     if (this._selectedFan < 0) {
       panel.hidden = true;
@@ -1474,4 +2178,4 @@ window.customCards.push({
 });
 
 // eslint-disable-next-line no-console
-console.info("%c HOME-3D-CARD %c loaded ", "background:#3b82f6;color:#fff", "");
+console.info("%c HOME-3D-CARD %c v0.2 loaded ", "background:#3b82f6;color:#fff", "");
