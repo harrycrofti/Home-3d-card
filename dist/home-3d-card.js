@@ -99,6 +99,8 @@ const DOMAIN_COLORS = {
   binary_sensor: "#ffe08a",
   lock: "#ff7a7a",
   media_player: "#b18cff",
+  device_tracker: "#3fd07a",
+  person: "#3fd07a",
 };
 
 /** Build a soft radial-gradient texture used for the glow sprites. */
@@ -1100,6 +1102,10 @@ class Home3DCard extends HTMLElement {
     } else if (domain === "binary_sensor") {
       active = s === "on";
       text = s === "on" ? a.device_class || "on" : "off";
+    } else if (domain === "device_tracker" || domain === "person") {
+      // Car / person tracker: glow when home, label shows charge% (battery attr).
+      active = s === "home";
+      text = a.battery != null ? `${a.battery}%` : s;
     } else {
       active = s === "on";
       text = s;
@@ -1706,6 +1712,9 @@ class Home3DCardEditor extends HTMLElement {
     } else if (domain === "binary_sensor") {
       active = s === "on";
       text = s;
+    } else if (domain === "device_tracker" || domain === "person") {
+      active = s === "home";
+      text = a.battery != null ? `${a.battery}%` : s;
     } else {
       active = s === "on";
     }
